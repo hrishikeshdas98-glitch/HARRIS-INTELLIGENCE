@@ -208,26 +208,32 @@ class HarrisCountyScraper:
         self.records=[]
 
     async def _shot(self, page, name):
-        """Save screenshot and log page info."""
+        """Save screenshot AND full HTML for debugging."""
+        Path("data").mkdir(parents=True, exist_ok=True)
+        # Screenshot
         try:
-            path = f"data/debug_{name}.png"
-            Path("data").mkdir(exist_ok=True)
-            await page.screenshot(path=path, full_page=True)
-            log.info(f"  Screenshot saved: {path}")
+            png_path = f"data/debug_{name}.png"
+            await page.screenshot(path=png_path, full_page=True)
+            log.info(f"  Screenshot → {png_path}")
         except Exception as e:
             log.warning(f"  Screenshot failed: {e}")
-
-        # Also dump HTML snippet
+        # Save full HTML
         try:
             html = await page.content()
-            log.info(f"  URL: {page.url}")
-            log.info(f"  Page size: {len(html)} chars")
-            # Log text content (first 800 chars, no tags)
-            soup = BeautifulSoup(html,"lxml")
-            text = " ".join(soup.get_text().split())[:800]
-            log.info(f"  Page text: {text}")
+            html_path = f"data/debug_{name}.html"
+            with open(html_path, "w", encoding="utf-8") as f:
+                f.write(html)
+            log.info(f"  HTML saved → {html_path} ({len(html)} chars)")
         except Exception as e:
-            log.warning(f"  HTML dump failed: {e}")
+            log.warning(f"  HTML save failed: {e}")
+        # Log URL and visible text
+        try:
+            log.info(f"  URL: {page.url}")
+            soup = BeautifulSoup(await page.content(), "lxml")
+            text = " ".join(soup.get_text().split())[:600]
+            log.info(f"  Text: {text}")
+        except Exception as e:
+            log.warning(f"  Text dump failed: {e}")
 
     async def run(self):
         async with async_playwright() as pw:
