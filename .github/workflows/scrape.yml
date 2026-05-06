@@ -42,6 +42,8 @@ jobs:
       - name: Run scraper
         env:
           PYTHONUNBUFFERED: "1"
+          CLERK_USERNAME: ${{ secrets.CLERK_USERNAME }}
+          CLERK_PASSWORD: ${{ secrets.CLERK_PASSWORD }}
         run: |
           mkdir -p dashboard data
           python scraper/fetch.py
