@@ -291,17 +291,26 @@ class DirectHTTPScraper:
         return False
 
     def _login(self) -> bool:
-        """Log in to the clerk portal using stored credentials."""
+        """
+        Log in via HTTP POST.
+        The portal's 'Log In' link triggers __doPostBack which opens a modal.
+        We POST directly to the ASP.NET Login control endpoint.
+        """
         if not CLERK_USERNAME or not CLERK_PASSWORD:
             log.warning("No credentials set — skipping login")
             return False
 
-        login_url = f"{CLERK_BASE}/applications/websearch/Home.aspx"
-        log.info(f"Logging in as {CLERK_USERNAME}…")
+        log.info(f"HTTP: logging in as {CLERK_USERNAME}…")
 
-        for attempt in range(MAX_RETRIES):
+        # Try each known login endpoint
+        login_urls = [
+            f"{CLERK_BASE}/applications/websearch/Home.aspx",
+            f"{CLERK_BASE}/applications/websearch/eLogin.aspx",
+            f"{CLERK_BASE}/applications/websearch/Login.aspx",
+        ]
+
+        for login_url in login_urls:
             try:
-                # Load the login page to grab tokens
                 r = self.session.get(login_url, timeout=20)
                 r.raise_for_status()
                 soup = BeautifulSoup(r.text, "lxml")
@@ -309,47 +318,48 @@ class DirectHTTPScraper:
                 ev  = self._hidden(soup, "__EVENTVALIDATION")
                 vsg = self._hidden(soup, "__VIEWSTATEGENERATOR")
 
-                # POST the login form — try all common ASP.NET login field names
+                if not vs:
+                    continue  # no form here, try next URL
+
+                # The ASP.NET Login control uses these field names
                 payload = {
                     "__VIEWSTATE":          vs,
                     "__VIEWSTATEGENERATOR": vsg,
                     "__EVENTVALIDATION":    ev,
-                    "__EVENTTARGET":        "",
+                    "__EVENTTARGET":        "ctl00$cphMain$Login1",
                     "__EVENTARGUMENT":      "",
-                    # Common login field name patterns
-                    "ctl00$cphMain$txtUserName":  CLERK_USERNAME,
-                    "ctl00$cphMain$txtPassword":  CLERK_PASSWORD,
-                    "ctl00$cphMain$txtEmail":     CLERK_USERNAME,
-                    "ctl00$cphMain$txtPass":      CLERK_PASSWORD,
-                    "ctl00$cphMain$btnLogin":     "Login",
-                    "ctl00$cphMain$btnSubmit":    "Login",
-                    # Simpler names
-                    "txtUserName": CLERK_USERNAME,
-                    "txtPassword": CLERK_PASSWORD,
-                    "txtEmail":    CLERK_USERNAME,
-                    "btnLogin":    "Login",
+                    # ASP.NET Login control field names
+                    "ctl00$cphMain$Login1$UserName": CLERK_USERNAME,
+                    "ctl00$cphMain$Login1$Password": CLERK_PASSWORD,
+                    "ctl00$cphMain$Login1$LoginButton": "Log In",
+                    # Alternate patterns
+                    "ctl00$cphMain$txtUserName": CLERK_USERNAME,
+                    "ctl00$cphMain$txtPassword": CLERK_PASSWORD,
+                    "ctl00$cphMain$btnLogin":    "Log In",
+                    # Simple names
+                    "UserName": CLERK_USERNAME,
+                    "Password": CLERK_PASSWORD,
                 }
 
                 r2 = self.session.post(login_url, data=payload, timeout=20)
                 r2.raise_for_status()
-
-                # Check if login worked — look for logout link or username in page
                 body = r2.text.lower()
-                if any(k in body for k in ("logout", "log out", "sign out", "welcome", "my account")):
-                    log.info("Login successful ✅")
+
+                if any(k in body for k in ("log out", "logout", "sign out", "my account", "welcome back")):
+                    log.info("HTTP login successful ✅")
                     return True
-                elif "invalid" in body or "incorrect" in body or "failed" in body:
-                    log.error("Login failed — check CLERK_USERNAME / CLERK_PASSWORD secrets")
+                elif any(k in body for k in ("invalid", "incorrect", "wrong")):
+                    log.error("HTTP login failed — check credentials")
                     return False
                 else:
-                    # Ambiguous — session cookie may still be set, continue anyway
-                    log.info("Login response ambiguous — proceeding with session")
-                    return True
+                    log.info(f"HTTP login at {login_url} — state unclear, proceeding")
+                    return True  # session cookie may be set regardless
 
             except Exception as exc:
-                log.warning(f"Login attempt {attempt+1}: {exc}")
-                time.sleep(RETRY_DELAY)
+                log.warning(f"HTTP login attempt at {login_url}: {exc}")
+                continue
 
+        log.warning("HTTP: all login URLs failed")
         return False
 
     def run(self) -> list:
@@ -412,9 +422,18 @@ class PlaywrightScraper:
         self.end   = end
 
     async def _login(self, page) -> bool:
-        """Log in via browser before searching."""
+        """
+        Log in via the clerk portal.
+        The site uses a JS __doPostBack link to open a login modal —
+        no traditional form on the home page.
+        Strategy:
+          1. Navigate to Home.aspx
+          2. Click the 'Log In' link (triggers __doPostBack modal OR redirect)
+          3. Wait for username/password fields to appear
+          4. Fill and submit
+        """
         if not CLERK_USERNAME or not CLERK_PASSWORD:
-            log.warning("No credentials — skipping Playwright login")
+            log.warning("No credentials set — skipping login")
             return False
 
         login_url = f"{CLERK_BASE}/applications/websearch/Home.aspx"
@@ -423,48 +442,113 @@ class PlaywrightScraper:
         try:
             await page.goto(login_url, wait_until="domcontentloaded", timeout=PW_TIMEOUT)
         except Exception as exc:
-            log.warning(f"PW login page load failed: {exc}")
+            log.warning(f"PW login page load: {exc}")
             return False
 
-        # Fill username
-        await self._try_fill(page, [
-            "input[id*='UserName']", "input[id*='Email']",
-            "input[name*='UserName']", "input[name*='Email']",
-            "#txtUserName", "#txtEmail",
-            "input[type='text']", "input[type='email']",
+        # The login link uses __doPostBack — click it via JS to open the modal
+        try:
+            await page.evaluate("__doPostBack('ctl00$LoginStatus1$ctl02','')")
+            await asyncio.sleep(1.5)
+        except Exception:
+            # Try clicking the visible "Log In" anchor text instead
+            try:
+                await page.click("a:has-text('Log In')", timeout=5_000)
+                await asyncio.sleep(1.5)
+            except Exception as exc:
+                log.warning(f"PW: could not trigger login modal: {exc}")
+
+        # After modal opens OR page redirects, look for input fields
+        # Try filling username in whichever field appears
+        filled_user = await self._try_fill(page, [
+            "#ctl00_cphMain_Login1_UserName",
+            "#ctl00_cphMain_txtUserName",
+            "input[id*='UserName']",
+            "input[id*='Email']",
+            "input[name*='UserName']",
+            "input[name*='Email']",
+            "input[type='email']",
+            "input[type='text']:not([id*='search']):not([id*='Search'])",
         ], CLERK_USERNAME)
 
-        # Fill password
-        await self._try_fill(page, [
-            "input[id*='Password']", "input[name*='Password']",
-            "#txtPassword", "input[type='password']",
+        filled_pass = await self._try_fill(page, [
+            "#ctl00_cphMain_Login1_Password",
+            "#ctl00_cphMain_txtPassword",
+            "input[id*='Password']",
+            "input[name*='Password']",
+            "input[type='password']",
         ], CLERK_PASSWORD)
 
-        # Click login button
+        if not filled_user or not filled_pass:
+            log.warning(f"PW: could not fill login fields (user={filled_user}, pass={filled_pass})")
+            # Try navigating directly to a login redirect URL as fallback
+            return await self._login_direct_post(page)
+
+        # Submit — the login form uses an ASP.NET Login control button
         clicked = await self._try_click(page, [
-            "input[id*='Login']", "button[id*='Login']",
-            "input[value='Login']", "button:has-text('Login')",
-            "input[type='submit']", "button[type='submit']",
+            "#ctl00_cphMain_Login1_LoginButton",
+            "input[id*='LoginButton']",
+            "input[id*='btnLogin']",
+            "input[value='Log In']",
+            "input[value='Login']",
+            "button:has-text('Log In')",
+            "button:has-text('Login')",
+            "input[type='submit']",
         ])
 
         if not clicked:
-            log.warning("PW: no login button found")
-            return False
+            # Try submitting the form via Enter key
+            try:
+                await page.keyboard.press("Enter")
+            except Exception:
+                pass
 
         try:
             await page.wait_for_load_state("networkidle", timeout=PW_TIMEOUT)
         except Exception:
             pass
 
+        return await self._check_logged_in(page)
+
+    async def _login_direct_post(self, page) -> bool:
+        """
+        Fallback: navigate directly to the eLogin page which some clerk
+        portals expose as a standalone form at /eLogin.aspx or /Login.aspx
+        """
+        for login_path in [
+            "/applications/websearch/eLogin.aspx",
+            "/applications/websearch/Login.aspx",
+            "/applications/websearch/eComm/Login.aspx",
+        ]:
+            url = CLERK_BASE + login_path
+            try:
+                r = await page.goto(url, wait_until="domcontentloaded", timeout=PW_TIMEOUT)
+                if r and r.ok:
+                    content = await page.content()
+                    if "password" in content.lower():
+                        log.info(f"Found login form at {url}")
+                        await self._try_fill(page, ["input[type='email']","input[type='text']","input[id*='User']"], CLERK_USERNAME)
+                        await self._try_fill(page, ["input[type='password']","input[id*='Pass']"], CLERK_PASSWORD)
+                        await self._try_click(page, ["input[type='submit']","button[type='submit']","input[value='Login']"])
+                        try:
+                            await page.wait_for_load_state("networkidle", timeout=PW_TIMEOUT)
+                        except Exception:
+                            pass
+                        return await self._check_logged_in(page)
+            except Exception:
+                continue
+        log.warning("PW: all login fallbacks exhausted")
+        return False
+
+    async def _check_logged_in(self, page) -> bool:
         body = (await page.content()).lower()
-        if any(k in body for k in ("logout", "log out", "sign out", "welcome", "my account")):
+        if any(k in body for k in ("log out", "logout", "sign out", "my account", "welcome back")):
             log.info("PW login successful ✅")
             return True
-        elif "invalid" in body or "incorrect" in body:
-            log.error("PW login failed — check credentials")
+        elif any(k in body for k in ("invalid", "incorrect", "failed", "wrong password")):
+            log.error("PW login failed — check CLERK_USERNAME / CLERK_PASSWORD secrets")
             return False
         else:
-            log.info("PW login ambiguous — proceeding")
+            log.info("PW login state unknown — proceeding anyway")
             return True
 
     async def run(self) -> list:
