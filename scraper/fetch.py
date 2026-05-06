@@ -301,6 +301,12 @@ class DirectHTTPScraper:
                 self._vs  = self._hidden(soup, "__VIEWSTATE")
                 self._ev  = self._hidden(soup, "__EVENTVALIDATION")
                 self._vsg = self._hidden(soup, "__VIEWSTATEGENERATOR")
+
+                # Debug: print ALL input/select field names on the page
+                all_inputs = soup.find_all(["input","select","textarea"])
+                field_names = [el.get("name","") for el in all_inputs if el.get("name")]
+                log.info(f"Form fields found on RP.aspx: {field_names}")
+
                 if self._vs:
                     log.info("ASP.NET tokens loaded")
                     return True
@@ -401,33 +407,47 @@ class DirectHTTPScraper:
     def _search(self, doc_code: str, label: str, cat: str) -> list:
         sd = self.start.strftime("%m/%d/%Y")
         ed = self.end.strftime("%m/%d/%Y")
+
+        # EXACT field names from browser Network payload inspection
         payload = {
             "__VIEWSTATE":          self._vs,
             "__VIEWSTATEGENERATOR": self._vsg,
             "__EVENTVALIDATION":    self._ev,
             "__EVENTTARGET":        "",
             "__EVENTARGUMENT":      "",
-            # Try all common ASP.NET control name patterns
-            "ctl00$cphMain$DocType":      doc_code,
-            "ctl00$cphMain$txtDocType":   doc_code,
-            "ctl00$cphMain$ddlDocType":   doc_code,
-            "ctl00$cphMain$txtStartDate": sd,
-            "ctl00$cphMain$txtEndDate":   ed,
-            "ctl00$cphMain$txtFromDate":  sd,
-            "ctl00$cphMain$txtToDate":    ed,
-            "ctl00$cphMain$btnSearch":    "Search",
-            "ctl00$cphMain$btnSubmit":    "Search",
-            # Simpler names
-            "DocType":    doc_code,
-            "StartDate":  sd,
-            "EndDate":    ed,
-            "btnSearch":  "Search",
+            "__LASTFOCUS":          "",
+            # ── Exact field names confirmed from portal payload ──
+            "ctl00$ContentPlaceHolder1$txtFileNo":    "",
+            "ctl00$ContentPlaceHolder1$txtFilmCd":    "",
+            "ctl00$ContentPlaceHolder1$txtFrom":      sd,
+            "ctl00$ContentPlaceHolder1$txtTo":        ed,
+            "ctl00$ContentPlaceHolder1$txtOR":        "",   # Grantor
+            "ctl00$ContentPlaceHolder1$txtEE":        "",   # Grantee
+            "ctl00$ContentPlaceHolder1$txtNameTee":   "",   # Trustee
+            "ctl00$ContentPlaceHolder1$txtDesc":      "",   # Description
+            "ctl00$ContentPlaceHolder1$txtInstrument": doc_code,  # Instrument Type
+            "ctl00$ContentPlaceHolder1$txtVolNo":     "",
+            "ctl00$ContentPlaceHolder1$txtPageNo":    "",
+            "ctl00$ContentPlaceHolder1$txtSection":   "",
+            "ctl00$ContentPlaceHolder1$txtLot":       "",
+            "ctl00$ContentPlaceHolder1$txtBlock":     "",
+            "ctl00$ContentPlaceHolder1$txtUnit":      "",
+            "ctl00$ContentPlaceHolder1$txtAbstract":  "",
+            "ctl00$ContentPlaceHolder1$txtOutLot":    "",
+            "ctl00$ContentPlaceHolder1$txtTract":     "",
+            "ctl00$ContentPlaceHolder1$txtReserve":   "",
+            "ctl00$ContentPlaceHolder1$btnSearch":    "Search",
         }
         for attempt in range(MAX_RETRIES):
             try:
                 r = self.session.post(CLERK_RP, data=payload, timeout=30)
                 r.raise_for_status()
-                return parse_table(r.text, doc_code, cat, label)
+                results = parse_table(r.text, doc_code, cat, label)
+                # If 0 results, log snippet to help debug
+                if not results:
+                    snippet = r.text[:300].replace("\n"," ").strip()
+                    log.info(f"  HTTP {doc_code} 0 results — page snippet: {snippet[:200]}")
+                return results
             except Exception as exc:
                 log.warning(f"  HTTP {doc_code} attempt {attempt+1}: {exc}")
                 time.sleep(RETRY_DELAY)
@@ -664,22 +684,28 @@ class PlaywrightScraper:
         sd = self.start.strftime("%m/%d/%Y")
         ed = self.end.strftime("%m/%d/%Y")
 
-        await self._try_select(page, [
-            "select[id*='DocType']","select[name*='DocType']","#ddlDocType",
+        # Exact IDs confirmed from browser payload (ContentPlaceHolder1 prefix)
+        await self._try_fill(page, [
+            "#ctl00_ContentPlaceHolder1_txtInstrument",
+            "input[name='ctl00$ContentPlaceHolder1$txtInstrument']",
+            "input[id*='txtInstrument']",
         ], doc_code)
         await self._try_fill(page, [
-            "input[id*='DocType']","input[name*='DocType']","#txtDocType",
-        ], doc_code)
-        await self._try_fill(page, [
-            "input[id*='Start']","input[id*='From']","#txtStartDate","#txtFromDate",
+            "#ctl00_ContentPlaceHolder1_txtFrom",
+            "input[name='ctl00$ContentPlaceHolder1$txtFrom']",
+            "input[id*='txtFrom']",
         ], sd)
         await self._try_fill(page, [
-            "input[id*='End']","input[id*='To']","#txtEndDate","#txtToDate",
+            "#ctl00_ContentPlaceHolder1_txtTo",
+            "input[name='ctl00$ContentPlaceHolder1$txtTo']",
+            "input[id*='txtTo']",
         ], ed)
 
         clicked = await self._try_click(page, [
-            "input[type='submit']","button[type='submit']",
-            "#btnSearch","input[value='Search']","button:has-text('Search')",
+            "#ctl00_ContentPlaceHolder1_btnSearch",
+            "input[name='ctl00$ContentPlaceHolder1$btnSearch']",
+            "input[value='Search']",
+            "input[type='submit']",
         ])
         if not clicked:
             return []
