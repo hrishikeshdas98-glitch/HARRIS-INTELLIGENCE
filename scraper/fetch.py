@@ -43,6 +43,7 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 CLERK_BASE = "https://www.cclerk.hctx.net"
 CLERK_RP   = f"{CLERK_BASE}/applications/websearch/RP.aspx"
+CLERK_RP_R = f"{CLERK_BASE}/applications/websearch/RP_R.aspx"  # results page
 
 HCAD_PAGES = [
     "https://pdata.hcad.org/download/2025.html",
@@ -53,7 +54,7 @@ HCAD_PAGES = [
 CLERK_USERNAME = os.environ.get("CLERK_USERNAME", "")
 CLERK_PASSWORD = os.environ.get("CLERK_PASSWORD", "")
 
-LOOK_BACK_DAYS = 100
+LOOK_BACK_DAYS = 7
 MAX_RETRIES    = 3
 RETRY_DELAY    = 2
 
@@ -61,34 +62,53 @@ PW_TIMEOUT  = 15_000   # 15 s page load
 PW_EL_WAIT  = 8_000    # 8 s per element find
 
 DOC_TYPES = {
-    "LP":       ("Lis Pendens",            "lis_pendens"),
-    "NOFC":     ("Notice of Foreclosure",  "foreclosure"),
-    "TAXDEED":  ("Tax Deed",               "tax_deed"),
-    "JUD":      ("Judgment",               "judgment"),
-    "CCJ":      ("Certified Judgment",     "judgment"),
-    "DRJUD":    ("Domestic Judgment",      "judgment"),
-    "LNCORPTX": ("Corp Tax Lien",          "tax_lien"),
-    "LNIRS":    ("IRS Lien",               "tax_lien"),
-    "LNFED":    ("Federal Lien",           "tax_lien"),
-    "LN":       ("Lien",                   "lien"),
-    "LNMECH":   ("Mechanic Lien",          "lien"),
-    "LNHOA":    ("HOA Lien",               "lien"),
-    "MEDLN":    ("Medicaid Lien",          "lien"),
-    "PRO":      ("Probate Document",       "probate"),
-    "NOC":      ("Notice of Commencement", "notice"),
-    "RELLP":    ("Release Lis Pendens",    "release"),
+    # ── Lis Pendens ───────────────────────────────────────────────────────────
+    "L/P":    ("Lis Pendens",                "lis_pendens"),
+
+    # ── Foreclosure ───────────────────────────────────────────────────────────
+    "TRSALE": ("Trustee Sale",               "foreclosure"),
+    "NOTICE": ("Notice (Foreclosure/Sale)",  "foreclosure"),
+
+    # ── Judgments ─────────────────────────────────────────────────────────────
+    "JUDGE":  ("Judgment",                   "judgment"),
+    "A/J":    ("Abstract of Judgment",       "judgment"),
+    "ORDER":  ("Court Order",                "judgment"),
+
+    # ── Federal / Tax Liens ───────────────────────────────────────────────────
+    "T/L":    ("Federal Tax Lien",           "tax_lien"),
+
+    # ── All Liens (HOA, State, Mechanic, Medical, etc.) ──────────────────────
+    "LIEN":   ("Lien",                       "lien"),
+    "L AFFT": ("Lien Affidavit",             "lien"),
+    "CONT":   ("Contract / Mechanic Lien",   "lien"),
+
+    # ── Probate ───────────────────────────────────────────────────────────────
+    "PROB":   ("Probate Proceedings",        "probate"),
+
+    # ── Releases ─────────────────────────────────────────────────────────────
+    "REL":    ("Release",                    "release"),
+
+    # ── Deeds ─────────────────────────────────────────────────────────────────
+    "DEED":   ("Deed",                       "deed"),
+    "D/T":    ("Deed of Trust",              "deed_of_trust"),
+
+    # ── Tax Receipt / Bankruptcy ──────────────────────────────────────────────
+    "BNKRCY": ("Bankruptcy",                 "bankruptcy"),
+    "T/R":    ("Tax Receipt",                "tax_receipt"),
 }
 
 CAT_LABELS = {
-    "lis_pendens": "Lis Pendens",
-    "foreclosure": "Pre-Foreclosure",
-    "tax_deed":    "Tax Deed",
-    "judgment":    "Judgment / Lien",
-    "tax_lien":    "Tax Lien",
-    "lien":        "Lien",
-    "probate":     "Probate / Estate",
-    "notice":      "Notice of Commencement",
-    "release":     "Release",
+    "lis_pendens":   "Lis Pendens",
+    "foreclosure":   "Pre-Foreclosure / Trustee Sale",
+    "judgment":      "Judgment / Abstract",
+    "tax_lien":      "Federal Tax Lien",
+    "lien":          "Lien",
+    "probate":       "Probate / Estate",
+    "release":       "Release",
+    "deed":          "Deed",
+    "deed_of_trust": "Deed of Trust",
+    "bankruptcy":    "Bankruptcy",
+    "tax_receipt":   "Tax Receipt",
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -174,8 +194,9 @@ def score_record(rec: dict) -> tuple:
     if cat == "foreclosure":     flags.append("Pre-foreclosure")
     if cat == "judgment":        flags.append("Judgment lien")
     if cat == "tax_lien":        flags.append("Tax lien")
-    if cat == "lien" and "MECH" in doc: flags.append("Mechanic lien")
+    if cat == "lien":            flags.append("Mechanic lien" if "MECH" in doc or "CONT" in doc else "Lien")
     if cat == "probate":         flags.append("Probate / estate")
+    if cat == "bankruptcy":      flags.append("Bankruptcy")
 
     owner = rec.get("owner", "")
     if owner and re.search(r"\b(LLC|INC|CORP|LTD|LP|TRUST|ASSOC)\b", owner, re.I):
@@ -526,9 +547,30 @@ class PlaywrightScraper:
                     content = await page.content()
                     if "password" in content.lower():
                         log.info(f"Found login form at {url}")
-                        await self._try_fill(page, ["input[type='email']","input[type='text']","input[id*='User']"], CLERK_USERNAME)
-                        await self._try_fill(page, ["input[type='password']","input[id*='Pass']"], CLERK_PASSWORD)
-                        await self._try_click(page, ["input[type='submit']","button[type='submit']","input[value='Login']"])
+                        # Use exact field labels seen on eLogin.aspx:
+                        # "User Name or Email" and "Password" with green "LOG IN" button
+                        await self._try_fill(page, [
+                            "input[id*='UserName']",
+                            "input[id*='Email']",
+                            "input[name*='UserName']",
+                            "input[placeholder*='User']",
+                            "input[type='email']",
+                            "input[type='text']",
+                        ], CLERK_USERNAME)
+                        await self._try_fill(page, [
+                            "input[id*='Password']",
+                            "input[name*='Password']",
+                            "input[type='password']",
+                        ], CLERK_PASSWORD)
+                        await self._try_click(page, [
+                            "input[value='LOG IN']",
+                            "input[value='Log In']",
+                            "input[value='Login']",
+                            "button:has-text('LOG IN')",
+                            "button:has-text('Log In')",
+                            "input[type='submit']",
+                            "button[type='submit']",
+                        ])
                         try:
                             await page.wait_for_load_state("networkidle", timeout=PW_TIMEOUT)
                         except Exception:
