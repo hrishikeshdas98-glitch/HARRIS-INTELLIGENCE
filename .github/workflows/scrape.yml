@@ -4,6 +4,19 @@ on:
   schedule:
     - cron: "0 7 * * *"   # 07:00 UTC = 02:00 CDT daily
   workflow_dispatch:        # manual trigger
+    inputs:
+      frcl_year:
+        description: "Foreclosure Year (e.g. 2026)"
+        required: false
+        default: ""
+      frcl_month:
+        description: "Foreclosure Month number (e.g. 6 for June)"
+        required: false
+        default: ""
+      look_back_days:
+        description: "Days to look back for RP records (default 7)"
+        required: false
+        default: "7"
 
 permissions:
   contents: write
@@ -44,6 +57,9 @@ jobs:
           PYTHONUNBUFFERED: "1"
           CLERK_USERNAME: ${{ secrets.CLERK_USERNAME }}
           CLERK_PASSWORD: ${{ secrets.CLERK_PASSWORD }}
+          FRCL_YEAR:  ${{ github.event.inputs.frcl_year }}
+          FRCL_MONTH: ${{ github.event.inputs.frcl_month }}
+          LOOK_BACK_DAYS: ${{ github.event.inputs.look_back_days || '7' }}
         run: |
           mkdir -p dashboard data
           python scraper/fetch.py
