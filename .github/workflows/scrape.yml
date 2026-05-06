@@ -64,6 +64,17 @@ jobs:
           mkdir -p dashboard data
           python scraper/fetch.py
 
+      # ── Upload debug artifacts ───────────────────────────────────────────────
+      - name: Upload debug artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: debug-artifacts
+          path: |
+            data/debug_*.png
+            data/debug_*.html
+          if-no-files-found: ignore
+
       # ── Commit results ───────────────────────────────────────────────────────
       - name: Commit & push records
         uses: stefanzweifel/git-auto-commit-action@v5
