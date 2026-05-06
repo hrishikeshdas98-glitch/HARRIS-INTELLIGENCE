@@ -54,7 +54,7 @@ HCAD_PAGES = [
 CLERK_USERNAME = os.environ.get("CLERK_USERNAME", "")
 CLERK_PASSWORD = os.environ.get("CLERK_PASSWORD", "")
 
-LOOK_BACK_DAYS = int(os.environ.get("LOOK_BACK_DAYS", "80"))
+LOOK_BACK_DAYS = int(os.environ.get("LOOK_BACK_DAYS", "7"))
 MAX_RETRIES    = 3
 RETRY_DELAY    = 2
 
@@ -440,13 +440,17 @@ class DirectHTTPScraper:
         }
         for attempt in range(MAX_RETRIES):
             try:
-                r = self.session.post(CLERK_RP, data=payload, timeout=30)
+                # POST to RP_R.aspx — the results page, not the form page
+                r = self.session.post(CLERK_RP_R, data=payload, timeout=30)
                 r.raise_for_status()
                 results = parse_table(r.text, doc_code, cat, label)
-                # If 0 results, log snippet to help debug
                 if not results:
-                    snippet = r.text[:300].replace("\n"," ").strip()
-                    log.info(f"  HTTP {doc_code} 0 results — page snippet: {snippet[:200]}")
+                    # Check if page says "no records" or is empty
+                    body = r.text.lower()
+                    if "no records" in body:
+                        log.info(f"  HTTP {doc_code}: no records found for date range")
+                    elif len(r.text) < 2000:
+                        log.info(f"  HTTP {doc_code}: short response ({len(r.text)} chars) — may need session fix")
                 return results
             except Exception as exc:
                 log.warning(f"  HTTP {doc_code} attempt {attempt+1}: {exc}")
@@ -477,43 +481,27 @@ class PlaywrightScraper:
             log.warning("No credentials set — skipping login")
             return False
 
-        login_url = f"{CLERK_BASE}/applications/websearch/Home.aspx"
+        # Go directly to eLogin.aspx — confirmed working from previous runs
+        login_url = f"{CLERK_BASE}/applications/websearch/eLogin.aspx"
         log.info(f"PW: logging in as {CLERK_USERNAME}…")
 
         try:
             await page.goto(login_url, wait_until="domcontentloaded", timeout=PW_TIMEOUT)
+            await asyncio.sleep(1)
         except Exception as exc:
             log.warning(f"PW login page load: {exc}")
             return False
 
-        # The login link uses __doPostBack — click it via JS to open the modal
-        try:
-            await page.evaluate("__doPostBack('ctl00$LoginStatus1$ctl02','')")
-            await asyncio.sleep(1.5)
-        except Exception:
-            # Try clicking the visible "Log In" anchor text instead
-            try:
-                await page.click("a:has-text('Log In')", timeout=5_000)
-                await asyncio.sleep(1.5)
-            except Exception as exc:
-                log.warning(f"PW: could not trigger login modal: {exc}")
-
-        # After modal opens OR page redirects, look for input fields
-        # Try filling username in whichever field appears
+        # Fill username — eLogin.aspx confirmed has these fields from screenshot
         filled_user = await self._try_fill(page, [
-            "#ctl00_cphMain_Login1_UserName",
-            "#ctl00_cphMain_txtUserName",
             "input[id*='UserName']",
             "input[id*='Email']",
             "input[name*='UserName']",
-            "input[name*='Email']",
             "input[type='email']",
-            "input[type='text']:not([id*='search']):not([id*='Search'])",
+            "input[type='text']",
         ], CLERK_USERNAME)
 
         filled_pass = await self._try_fill(page, [
-            "#ctl00_cphMain_Login1_Password",
-            "#ctl00_cphMain_txtPassword",
             "input[id*='Password']",
             "input[name*='Password']",
             "input[type='password']",
@@ -521,23 +509,20 @@ class PlaywrightScraper:
 
         if not filled_user or not filled_pass:
             log.warning(f"PW: could not fill login fields (user={filled_user}, pass={filled_pass})")
-            # Try navigating directly to a login redirect URL as fallback
-            return await self._login_direct_post(page)
+            return False
 
-        # Submit — the login form uses an ASP.NET Login control button
+        # Click LOG IN button — confirmed green button text from screenshot
         clicked = await self._try_click(page, [
-            "#ctl00_cphMain_Login1_LoginButton",
-            "input[id*='LoginButton']",
-            "input[id*='btnLogin']",
+            "input[value='LOG IN']",
             "input[value='Log In']",
             "input[value='Login']",
+            "button:has-text('LOG IN')",
             "button:has-text('Log In')",
-            "button:has-text('Login')",
             "input[type='submit']",
+            "button[type='submit']",
         ])
 
         if not clicked:
-            # Try submitting the form via Enter key
             try:
                 await page.keyboard.press("Enter")
             except Exception:
@@ -642,15 +627,16 @@ class PlaywrightScraper:
             await browser.close()
         return records
 
-    async def _try_fill(self, page, selectors: list, value: str):
+    async def _try_fill(self, page, selectors: list, value: str) -> bool:
         for sel in selectors:
             try:
                 el = await page.wait_for_selector(sel, timeout=PW_EL_WAIT)
                 if el:
                     await el.fill(value)
-                    return
+                    return True
             except Exception:
                 continue
+        return False
 
     async def _try_select(self, page, selectors: list, value: str):
         for sel in selectors:
@@ -711,9 +697,13 @@ class PlaywrightScraper:
             return []
 
         try:
-            await page.wait_for_load_state("networkidle", timeout=PW_TIMEOUT)
+            # Wait for redirect to RP_R.aspx (results page)
+            await page.wait_for_url("**/RP_R.aspx**", timeout=PW_TIMEOUT)
         except Exception:
-            pass  # partial load is OK, parse what we have
+            try:
+                await page.wait_for_load_state("networkidle", timeout=PW_TIMEOUT)
+            except Exception:
+                pass
 
         # Collect all pages
         all_rows = []
