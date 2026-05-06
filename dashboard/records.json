@@ -1,8 +1,8 @@
 {
-  "fetched_at": "2026-05-06T16:49:18.245024Z",
-  "source": "Harris County Clerk - cclerk.hctx.net",
+  "fetched_at": "2026-05-06T19:41:40.103296Z",
+  "source": "Harris County Clerk",
   "date_range": {
-    "start": "2026-02-05",
+    "start": "2026-02-15",
     "end": "2026-05-06"
   },
   "foreclosure_month": "2026-06",
