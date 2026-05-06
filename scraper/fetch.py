@@ -54,7 +54,7 @@ HCAD_PAGES = [
 CLERK_USERNAME = os.environ.get("CLERK_USERNAME", "")
 CLERK_PASSWORD = os.environ.get("CLERK_PASSWORD", "")
 
-LOOK_BACK_DAYS = 60
+LOOK_BACK_DAYS = int(os.environ.get("LOOK_BACK_DAYS", "7"))
 MAX_RETRIES    = 3
 RETRY_DELAY    = 2
 
@@ -714,6 +714,327 @@ class PlaywrightScraper:
         return all_rows
 
 # ─────────────────────────────────────────────────────────────────────────────
+# FORECLOSURE SCRAPER  (FRCL_R.aspx — dedicated monthly foreclosure listings)
+# This page uses year + month selectors, completely separate from RP search.
+# ─────────────────────────────────────────────────────────────────────────────
+class ForeclosureScraper:
+    """
+    Scrapes https://www.cclerk.hctx.net/applications/websearch/FRCL_R.aspx
+    Selects year and month via __doPostBack, parses the resulting table.
+    Can scrape any month/year combination.
+    """
+
+    FRCL_URL = f"{CLERK_BASE}/applications/websearch/FRCL_R.aspx"
+
+    # Month name → number mapping as used by the portal dropdown
+    MONTH_NAMES = {
+        1:"January", 2:"February", 3:"March", 4:"April",
+        5:"May", 6:"June", 7:"July", 8:"August",
+        9:"September", 10:"October", 11:"November", 12:"December",
+    }
+
+    def __init__(self, year: int, month: int):
+        self.year  = year
+        self.month = month
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Referer": f"{CLERK_BASE}/applications/websearch/FRCL_R.aspx",
+        })
+
+    def _hidden(self, soup: BeautifulSoup, name: str) -> str:
+        el = soup.find("input", {"name": name})
+        return el["value"] if el and el.get("value") else ""
+
+    def _login(self) -> bool:
+        """Log in using same credentials as main scraper."""
+        if not CLERK_USERNAME or not CLERK_PASSWORD:
+            return False
+        login_url = f"{CLERK_BASE}/applications/websearch/eLogin.aspx"
+        try:
+            r = self.session.get(login_url, timeout=20)
+            soup = BeautifulSoup(r.text, "lxml")
+            vs  = self._hidden(soup, "__VIEWSTATE")
+            ev  = self._hidden(soup, "__EVENTVALIDATION")
+            vsg = self._hidden(soup, "__VIEWSTATEGENERATOR")
+            payload = {
+                "__VIEWSTATE": vs, "__EVENTVALIDATION": ev,
+                "__VIEWSTATEGENERATOR": vsg,
+                "__EVENTTARGET": "", "__EVENTARGUMENT": "",
+                "ctl00$cphMain$Login1$UserName": CLERK_USERNAME,
+                "ctl00$cphMain$Login1$Password": CLERK_PASSWORD,
+                "ctl00$cphMain$Login1$LoginButton": "Log In",
+                "UserName": CLERK_USERNAME,
+                "Password": CLERK_PASSWORD,
+            }
+            r2 = self.session.post(login_url, data=payload, timeout=20)
+            body = r2.text.lower()
+            if any(k in body for k in ("log out","logout","my account","welcome")):
+                log.info("ForeclosureScraper: login OK ✅")
+                return True
+            log.info("ForeclosureScraper: login ambiguous — proceeding")
+            return True
+        except Exception as exc:
+            log.warning(f"ForeclosureScraper login: {exc}")
+            return False
+
+    def _load_page(self) -> Optional[BeautifulSoup]:
+        """Load the base FRCL_R page and return its soup."""
+        for attempt in range(MAX_RETRIES):
+            try:
+                r = self.session.get(self.FRCL_URL, timeout=20)
+                r.raise_for_status()
+                return BeautifulSoup(r.text, "lxml")
+            except Exception as exc:
+                log.warning(f"FRCL load attempt {attempt+1}: {exc}")
+                time.sleep(RETRY_DELAY)
+        return None
+
+    def _select_year_month(self, soup: BeautifulSoup) -> Optional[BeautifulSoup]:
+        """
+        The page uses __doPostBack to select year then month.
+        We POST the form with the year value, then POST again with month.
+        """
+        vs  = self._hidden(soup, "__VIEWSTATE")
+        ev  = self._hidden(soup, "__EVENTVALIDATION")
+        vsg = self._hidden(soup, "__VIEWSTATEGENERATOR")
+
+        # Step 1: Select year
+        year_payload = {
+            "__VIEWSTATE":          vs,
+            "__VIEWSTATEGENERATOR": vsg,
+            "__EVENTVALIDATION":    ev,
+            "__EVENTTARGET":        "ctl00$cphMain$GridView1",
+            "__EVENTARGUMENT":      f"Select${self.year}",
+            # Also try direct year field
+            "ctl00$cphMain$ddlYear": str(self.year),
+            "ctl00$cphMain$ddlMonth": self.MONTH_NAMES.get(self.month, "June"),
+            "ctl00$cphMain$btnSearch": "Search",
+        }
+
+        try:
+            r = self.session.post(self.FRCL_URL, data=year_payload, timeout=30)
+            r.raise_for_status()
+            soup2 = BeautifulSoup(r.text, "lxml")
+            vs2  = self._hidden(soup2, "__VIEWSTATE")
+            ev2  = self._hidden(soup2, "__EVENTVALIDATION")
+            vsg2 = self._hidden(soup2, "__VIEWSTATEGENERATOR")
+
+            # Step 2: Select month
+            month_payload = {
+                "__VIEWSTATE":          vs2,
+                "__VIEWSTATEGENERATOR": vsg2,
+                "__EVENTVALIDATION":    ev2,
+                "__EVENTTARGET":        "ctl00$cphMain$GridView1",
+                "__EVENTARGUMENT":      f"Select${self.MONTH_NAMES.get(self.month,'June')}",
+                "ctl00$cphMain$ddlYear":  str(self.year),
+                "ctl00$cphMain$ddlMonth": self.MONTH_NAMES.get(self.month, "June"),
+                "ctl00$cphMain$btnSearch": "Search",
+            }
+
+            r2 = self.session.post(self.FRCL_URL, data=month_payload, timeout=30)
+            r2.raise_for_status()
+            return BeautifulSoup(r2.text, "lxml")
+
+        except Exception as exc:
+            log.warning(f"FRCL year/month select: {exc}")
+            return None
+
+    def _parse_foreclosure_table(self, soup: BeautifulSoup) -> list:
+        """Parse the foreclosure listing table."""
+        records = []
+        tables = soup.find_all("table")
+
+        for tbl in tables:
+            rows = tbl.find_all("tr")
+            if len(rows) < 2:
+                continue
+            headers = [th.get_text(strip=True).lower() for th in rows[0].find_all(["th","td"])]
+            if not any(k in " ".join(headers) for k in ("grantor","trustee","sale","file","doc","name")):
+                continue
+
+            log.info(f"FRCL: found table with {len(rows)-1} data rows, headers: {headers}")
+
+            for tr in rows[1:]:
+                tds = tr.find_all("td")
+                if len(tds) < 2:
+                    continue
+                try:
+                    # Extract link
+                    link = ""
+                    for td in tds:
+                        a = td.find("a", href=True)
+                        if a:
+                            href = a["href"]
+                            link = href if href.startswith("http") else f"{CLERK_BASE}/{href.lstrip('/')}"
+                            break
+
+                    def cell(idx):
+                        return tds[idx].get_text(strip=True) if idx < len(tds) else ""
+
+                    # Try to map columns by header name
+                    def col(key):
+                        for i, h in enumerate(headers):
+                            if key in h and i < len(tds):
+                                return tds[i].get_text(strip=True)
+                        return ""
+
+                    doc_num   = col("doc") or col("file") or col("id") or cell(0)
+                    sale_date = parse_date(col("sale") or cell(1))
+                    file_date = parse_date(col("file") or col("date") or cell(2))
+                    grantor   = col("grantor") or col("name") or col("trustor") or cell(3)
+                    trustee   = col("trustee") or col("grantee") or cell(4)
+                    legal     = col("legal") or col("description") or col("property") or cell(5)
+                    amount    = parse_amount(col("amount") or col("balance") or col("bid") or cell(6))
+
+                    if not doc_num and not grantor:
+                        continue
+
+                    rec = blank_record("TRSALE", "foreclosure", "Trustee Sale")
+                    rec.update({
+                        "doc_num":   doc_num,
+                        "doc_type":  "TRSALE",
+                        "filed":     file_date or sale_date,
+                        "cat":       "foreclosure",
+                        "cat_label": "Foreclosure Sale",
+                        "owner":     grantor,
+                        "grantee":   trustee,
+                        "amount":    amount,
+                        "legal":     legal,
+                        "clerk_url": link or f"{self.FRCL_URL}",
+                        # Store sale date separately in legal if different
+                    })
+                    # Tag sale date into legal for reference
+                    if sale_date and sale_date != file_date:
+                        rec["legal"] = f"Sale Date: {sale_date} | {legal}".strip(" |")
+
+                    records.append(rec)
+                except Exception:
+                    continue
+
+        return records
+
+    def run(self) -> list:
+        """Full scrape: login → load page → select year/month → parse table."""
+        log.info(f"=== Foreclosure Scraper: {self.MONTH_NAMES.get(self.month)} {self.year} ===")
+
+        self._login()
+
+        soup = self._load_page()
+        if not soup:
+            log.error("FRCL: could not load page")
+            return []
+
+        # Try Playwright-style __doPostBack selection via HTTP
+        result_soup = self._select_year_month(soup)
+        if not result_soup:
+            log.warning("FRCL: year/month selection failed, trying to parse base page")
+            result_soup = soup
+
+        records = self._parse_foreclosure_table(result_soup)
+        log.info(f"FRCL: {len(records)} foreclosure records for {self.MONTH_NAMES.get(self.month)} {self.year}")
+        return records
+
+
+async def scrape_foreclosures_playwright(year: int, month: int) -> list:
+    """
+    Playwright fallback for the foreclosure page.
+    Clicks the year then month in the list UI.
+    """
+    if not HAS_PLAYWRIGHT:
+        return []
+
+    FRCL_URL = f"{CLERK_BASE}/applications/websearch/FRCL_R.aspx"
+    month_name = {
+        1:"January",2:"February",3:"March",4:"April",
+        5:"May",6:"June",7:"July",8:"August",
+        9:"September",10:"October",11:"November",12:"December",
+    }.get(month, "June")
+
+    records = []
+    log.info(f"PW Foreclosure: {month_name} {year}")
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage"])
+        ctx  = await browser.new_context(user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ))
+        page = await ctx.new_page()
+        page.set_default_timeout(PW_TIMEOUT)
+
+        # Login
+        try:
+            await page.goto(f"{CLERK_BASE}/applications/websearch/eLogin.aspx",
+                            wait_until="domcontentloaded", timeout=PW_TIMEOUT)
+            await asyncio.sleep(1)
+            # Fill credentials
+            for sel in ["input[id*='UserName']","input[id*='Email']","input[type='email']","input[type='text']"]:
+                try:
+                    el = await page.wait_for_selector(sel, timeout=3_000)
+                    if el: await el.fill(CLERK_USERNAME); break
+                except Exception: continue
+            for sel in ["input[id*='Password']","input[type='password']"]:
+                try:
+                    el = await page.wait_for_selector(sel, timeout=3_000)
+                    if el: await el.fill(CLERK_PASSWORD); break
+                except Exception: continue
+            for sel in ["input[value='LOG IN']","input[value='Log In']","input[type='submit']","button[type='submit']"]:
+                try:
+                    el = await page.wait_for_selector(sel, timeout=3_000)
+                    if el: await el.click(); break
+                except Exception: continue
+            await page.wait_for_load_state("networkidle", timeout=PW_TIMEOUT)
+            log.info("PW FRCL: login done")
+        except Exception as exc:
+            log.warning(f"PW FRCL login: {exc}")
+
+        # Navigate to foreclosure page
+        try:
+            await page.goto(FRCL_URL, wait_until="domcontentloaded", timeout=PW_TIMEOUT)
+            await asyncio.sleep(1)
+        except Exception as exc:
+            log.warning(f"PW FRCL nav: {exc}")
+            await browser.close()
+            return []
+
+        # Click the year
+        try:
+            year_el = await page.wait_for_selector(f"text={year}", timeout=5_000)
+            if year_el:
+                await year_el.click()
+                await page.wait_for_load_state("networkidle", timeout=PW_TIMEOUT)
+                await asyncio.sleep(1)
+        except Exception as exc:
+            log.warning(f"PW FRCL year click: {exc}")
+
+        # Click the month
+        try:
+            month_el = await page.wait_for_selector(f"text={month_name}", timeout=5_000)
+            if month_el:
+                await month_el.click()
+                await page.wait_for_load_state("networkidle", timeout=PW_TIMEOUT)
+                await asyncio.sleep(1)
+        except Exception as exc:
+            log.warning(f"PW FRCL month click: {exc}")
+
+        # Parse whatever is on the page now
+        html = await page.content()
+        soup = BeautifulSoup(html, "lxml")
+        scraper = ForeclosureScraper(year, month)
+        records = scraper._parse_foreclosure_table(soup)
+
+        await browser.close()
+
+    log.info(f"PW FRCL: {len(records)} records")
+    return records
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # HCAD PARCEL DB
 # ─────────────────────────────────────────────────────────────────────────────
 class ParcelDB:
@@ -872,10 +1193,19 @@ async def main():
     start_dt = end_dt - timedelta(days=LOOK_BACK_DAYS)
     log.info(f"Date range: {start_dt.date()} → {end_dt.date()}")
 
+    # Foreclosure month/year — default to NEXT month (upcoming sales)
+    # Override with env vars FRCL_YEAR and FRCL_MONTH
+    now = datetime.now()
+    # Default: next month (foreclosure sales are posted ~1 month ahead)
+    next_month_dt = (now.replace(day=1) + timedelta(days=32)).replace(day=1)
+    frcl_year  = int(os.environ.get("FRCL_YEAR",  next_month_dt.year))
+    frcl_month = int(os.environ.get("FRCL_MONTH", next_month_dt.month))
+    log.info(f"Foreclosure target: {frcl_year}-{frcl_month:02d}")
+
     records: list = []
 
-    # ── 1. Fast HTTP scrape ───────────────────────────────────────────────────
-    log.info("=== Direct HTTP scrape ===")
+    # ── 1. Fast HTTP scrape (RP.aspx doc types) ───────────────────────────────
+    log.info("=== Direct HTTP scrape (RP.aspx) ===")
     try:
         http = DirectHTTPScraper(start_dt, end_dt)
         records = http.run()
@@ -883,15 +1213,35 @@ async def main():
     except Exception:
         log.error(traceback.format_exc())
 
-    # ── 2. Playwright fallback (only if HTTP got nothing) ─────────────────────
+    # ── 2. Playwright fallback for RP.aspx (only if HTTP got nothing) ─────────
     if not records and HAS_PLAYWRIGHT:
-        log.info("=== Playwright fallback ===")
+        log.info("=== Playwright fallback (RP.aspx) ===")
         try:
             pw = PlaywrightScraper(start_dt, end_dt)
             records = await pw.run()
             log.info(f"Playwright total: {len(records)}")
         except Exception:
             log.error(traceback.format_exc())
+
+    # ── 3. Foreclosure page scrape (FRCL_R.aspx) — always runs ───────────────
+    log.info("=== Foreclosure page scrape (FRCL_R.aspx) ===")
+    frcl_records: list = []
+    try:
+        frcl = ForeclosureScraper(frcl_year, frcl_month)
+        frcl_records = frcl.run()
+    except Exception:
+        log.error(traceback.format_exc())
+
+    # Playwright fallback for foreclosures if HTTP got nothing
+    if not frcl_records and HAS_PLAYWRIGHT:
+        log.info("=== Playwright fallback (FRCL_R.aspx) ===")
+        try:
+            frcl_records = await scrape_foreclosures_playwright(frcl_year, frcl_month)
+        except Exception:
+            log.error(traceback.format_exc())
+
+    log.info(f"Foreclosure records: {len(frcl_records)}")
+    records.extend(frcl_records)
 
     # ── Dedup ─────────────────────────────────────────────────────────────────
     seen: set = set()
@@ -901,6 +1251,12 @@ async def main():
         if key and key not in seen:
             seen.add(key)
             unique.append(r)
+        elif not key:
+            # No doc num — dedup by owner+date
+            key2 = f"{r.get('owner','')}-{r.get('filed','')}"
+            if key2 not in seen:
+                seen.add(key2)
+                unique.append(r)
     records = unique
     log.info(f"Unique records: {len(records)}")
 
@@ -929,9 +1285,9 @@ async def main():
             continue
 
     # ── Score — with LP+FC portfolio combo bonus ──────────────────────────────
-    lp_owners  = {r["owner"] for r in records if r.get("cat") == "lis_pendens" and r.get("owner")}
-    fc_owners  = {r["owner"] for r in records if r.get("cat") == "foreclosure"  and r.get("owner")}
-    combo      = lp_owners & fc_owners
+    lp_owners = {r["owner"] for r in records if r.get("cat") == "lis_pendens" and r.get("owner")}
+    fc_owners = {r["owner"] for r in records if r.get("cat") == "foreclosure"  and r.get("owner")}
+    combo     = lp_owners & fc_owners
 
     for r in records:
         try:
@@ -953,7 +1309,11 @@ async def main():
     output = {
         "fetched_at":   datetime.utcnow().isoformat() + "Z",
         "source":       "Harris County Clerk - cclerk.hctx.net",
-        "date_range":   {"start": start_dt.strftime("%Y-%m-%d"), "end": end_dt.strftime("%Y-%m-%d")},
+        "date_range":   {
+            "start": start_dt.strftime("%Y-%m-%d"),
+            "end":   end_dt.strftime("%Y-%m-%d"),
+        },
+        "foreclosure_month": f"{frcl_year}-{frcl_month:02d}",
         "total":        len(records),
         "with_address": with_address,
         "records":      records,
@@ -968,7 +1328,7 @@ async def main():
     today = datetime.now().strftime("%Y%m%d")
     export_ghl_csv(records, f"data/ghl_export_{today}.csv")
 
-    log.info(f"✅ Done — {len(records)} leads | {with_address} with address")
+    log.info(f"✅ Done — {len(records)} total leads | {len(frcl_records)} foreclosures | {with_address} with address")
 
 
 if __name__ == "__main__":
