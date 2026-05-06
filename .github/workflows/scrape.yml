@@ -73,6 +73,7 @@ jobs:
             dashboard/records.json
             data/records.json
             data/ghl_export_*.csv
+            data/debug_*.png
 
   # ── Deploy dashboard to GitHub Pages ────────────────────────────────────────
   deploy-pages:
