@@ -50,6 +50,9 @@ HCAD_PAGES = [
     "https://hcad.org/hcad-resources/hcad-appraisal-codes-and-data-download/",
 ]
 
+CLERK_USERNAME = os.environ.get("CLERK_USERNAME", "")
+CLERK_PASSWORD = os.environ.get("CLERK_PASSWORD", "")
+
 LOOK_BACK_DAYS = 7
 MAX_RETRIES    = 3
 RETRY_DELAY    = 2
@@ -287,7 +290,71 @@ class DirectHTTPScraper:
                 time.sleep(RETRY_DELAY)
         return False
 
+    def _login(self) -> bool:
+        """Log in to the clerk portal using stored credentials."""
+        if not CLERK_USERNAME or not CLERK_PASSWORD:
+            log.warning("No credentials set — skipping login")
+            return False
+
+        login_url = f"{CLERK_BASE}/applications/websearch/Home.aspx"
+        log.info(f"Logging in as {CLERK_USERNAME}…")
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                # Load the login page to grab tokens
+                r = self.session.get(login_url, timeout=20)
+                r.raise_for_status()
+                soup = BeautifulSoup(r.text, "lxml")
+                vs  = self._hidden(soup, "__VIEWSTATE")
+                ev  = self._hidden(soup, "__EVENTVALIDATION")
+                vsg = self._hidden(soup, "__VIEWSTATEGENERATOR")
+
+                # POST the login form — try all common ASP.NET login field names
+                payload = {
+                    "__VIEWSTATE":          vs,
+                    "__VIEWSTATEGENERATOR": vsg,
+                    "__EVENTVALIDATION":    ev,
+                    "__EVENTTARGET":        "",
+                    "__EVENTARGUMENT":      "",
+                    # Common login field name patterns
+                    "ctl00$cphMain$txtUserName":  CLERK_USERNAME,
+                    "ctl00$cphMain$txtPassword":  CLERK_PASSWORD,
+                    "ctl00$cphMain$txtEmail":     CLERK_USERNAME,
+                    "ctl00$cphMain$txtPass":      CLERK_PASSWORD,
+                    "ctl00$cphMain$btnLogin":     "Login",
+                    "ctl00$cphMain$btnSubmit":    "Login",
+                    # Simpler names
+                    "txtUserName": CLERK_USERNAME,
+                    "txtPassword": CLERK_PASSWORD,
+                    "txtEmail":    CLERK_USERNAME,
+                    "btnLogin":    "Login",
+                }
+
+                r2 = self.session.post(login_url, data=payload, timeout=20)
+                r2.raise_for_status()
+
+                # Check if login worked — look for logout link or username in page
+                body = r2.text.lower()
+                if any(k in body for k in ("logout", "log out", "sign out", "welcome", "my account")):
+                    log.info("Login successful ✅")
+                    return True
+                elif "invalid" in body or "incorrect" in body or "failed" in body:
+                    log.error("Login failed — check CLERK_USERNAME / CLERK_PASSWORD secrets")
+                    return False
+                else:
+                    # Ambiguous — session cookie may still be set, continue anyway
+                    log.info("Login response ambiguous — proceeding with session")
+                    return True
+
+            except Exception as exc:
+                log.warning(f"Login attempt {attempt+1}: {exc}")
+                time.sleep(RETRY_DELAY)
+
+        return False
+
     def run(self) -> list:
+        # Login first, then load search tokens
+        self._login()
         if not self._load_tokens():
             return []
         records = []
@@ -344,6 +411,62 @@ class PlaywrightScraper:
         self.start = start
         self.end   = end
 
+    async def _login(self, page) -> bool:
+        """Log in via browser before searching."""
+        if not CLERK_USERNAME or not CLERK_PASSWORD:
+            log.warning("No credentials — skipping Playwright login")
+            return False
+
+        login_url = f"{CLERK_BASE}/applications/websearch/Home.aspx"
+        log.info(f"PW: logging in as {CLERK_USERNAME}…")
+
+        try:
+            await page.goto(login_url, wait_until="domcontentloaded", timeout=PW_TIMEOUT)
+        except Exception as exc:
+            log.warning(f"PW login page load failed: {exc}")
+            return False
+
+        # Fill username
+        await self._try_fill(page, [
+            "input[id*='UserName']", "input[id*='Email']",
+            "input[name*='UserName']", "input[name*='Email']",
+            "#txtUserName", "#txtEmail",
+            "input[type='text']", "input[type='email']",
+        ], CLERK_USERNAME)
+
+        # Fill password
+        await self._try_fill(page, [
+            "input[id*='Password']", "input[name*='Password']",
+            "#txtPassword", "input[type='password']",
+        ], CLERK_PASSWORD)
+
+        # Click login button
+        clicked = await self._try_click(page, [
+            "input[id*='Login']", "button[id*='Login']",
+            "input[value='Login']", "button:has-text('Login')",
+            "input[type='submit']", "button[type='submit']",
+        ])
+
+        if not clicked:
+            log.warning("PW: no login button found")
+            return False
+
+        try:
+            await page.wait_for_load_state("networkidle", timeout=PW_TIMEOUT)
+        except Exception:
+            pass
+
+        body = (await page.content()).lower()
+        if any(k in body for k in ("logout", "log out", "sign out", "welcome", "my account")):
+            log.info("PW login successful ✅")
+            return True
+        elif "invalid" in body or "incorrect" in body:
+            log.error("PW login failed — check credentials")
+            return False
+        else:
+            log.info("PW login ambiguous — proceeding")
+            return True
+
     async def run(self) -> list:
         records = []
         async with async_playwright() as pw:
@@ -358,6 +481,9 @@ class PlaywrightScraper:
             ))
             page = await ctx.new_page()
             page.set_default_timeout(PW_TIMEOUT)
+
+            # Login first
+            await self._login(page)
 
             for doc_code, (label, cat) in DOC_TYPES.items():
                 try:
