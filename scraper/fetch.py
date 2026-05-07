@@ -758,6 +758,195 @@ class HarrisCountyScraper:
         return records
 
 # ─────────────────────────────────────────────────────────────────────────────
+# FRCL PDF ENRICHER
+# Each FRCL record links to a PDF with: owner name, address, sale date, amount
+# We fetch the PDF, extract text, and parse the key fields
+# ─────────────────────────────────────────────────────────────────────────────
+class FRCLPDFEnricher:
+    """
+    Fetches each FRCL document PDF and extracts:
+    - Owner/grantor name
+    - Property address
+    - Sale date
+    - Original deed date
+    - Debt amount
+    - Mortgagee/lender
+    """
+
+    def __init__(self, session: requests.Session):
+        self.session = session
+
+    def enrich(self, records: list) -> list:
+        """Enrich all FRCL records with PDF data."""
+        frcl_recs = [r for r in records if r.get("doc_type") == "FRCL" and r.get("clerk_url")]
+        log.info(f"PDF enrichment: {len(frcl_recs)} FRCL records to process")
+
+        enriched = 0
+        for i, rec in enumerate(frcl_recs):
+            try:
+                data = self._fetch_pdf_text(rec["clerk_url"])
+                if data:
+                    # Update the record in-place
+                    if data.get("owner"):     rec["owner"]        = data["owner"]
+                    if data.get("address"):   rec["prop_address"] = data["address"]
+                    if data.get("city"):      rec["prop_city"]    = data["city"]
+                    if data.get("zip"):       rec["prop_zip"]     = data["zip"]
+                    if data.get("amount"):    rec["amount"]       = data["amount"]
+                    if data.get("deed_date"): rec["legal"]        = f"Deed: {data['deed_date']} | {rec.get('legal','')}"
+                    if data.get("lender"):    rec["grantee"]      = data["lender"]
+                    enriched += 1
+                if (i+1) % 50 == 0:
+                    log.info(f"  PDF progress: {i+1}/{len(frcl_recs)} ({enriched} enriched)")
+                time.sleep(0.15)  # gentle rate limiting
+            except Exception as exc:
+                log.warning(f"  PDF {rec.get('doc_num')}: {exc}")
+                continue
+
+        log.info(f"PDF enrichment complete: {enriched}/{len(frcl_recs)} records enriched")
+        return records
+
+    def _fetch_pdf_text(self, url: str) -> Optional[dict]:
+        """
+        Fetch the PDF viewer page, get the actual PDF URL, download and extract text.
+        The clerk URL opens a viewer page — we need to find the actual PDF link.
+        """
+        # First try: fetch the viewer page and find the PDF src
+        try:
+            r = self.session.get(url, timeout=20)
+            r.raise_for_status()
+
+            # Look for PDF embed or direct PDF link
+            soup = BeautifulSoup(r.text, "lxml")
+
+            pdf_url = None
+            # Common patterns for embedded PDF viewers
+            for tag in soup.find_all(["iframe", "embed", "object"]):
+                src = tag.get("src", "") or tag.get("data", "")
+                if ".pdf" in src.lower() or "pdf" in src.lower():
+                    pdf_url = src if src.startswith("http") else f"{CLERK_BASE}/{src.lstrip('/')}"
+                    break
+
+            # Look for direct PDF links
+            if not pdf_url:
+                for a in soup.find_all("a", href=True):
+                    if ".pdf" in a["href"].lower():
+                        pdf_url = a["href"] if a["href"].startswith("http") else f"{CLERK_BASE}/{a['href'].lstrip('/')}"
+                        break
+
+            # Some portals serve the PDF directly from the viewer URL with a param
+            if not pdf_url:
+                # Try appending common PDF export params
+                for param in ["?format=pdf", "&format=pdf", "/pdf"]:
+                    test_url = url + param
+                    try:
+                        tr = self.session.head(test_url, timeout=10)
+                        if "pdf" in tr.headers.get("content-type", "").lower():
+                            pdf_url = test_url
+                            break
+                    except: continue
+
+            if not pdf_url:
+                # If viewer page itself is PDF content
+                if "pdf" in r.headers.get("content-type", "").lower():
+                    return self._parse_pdf_bytes(r.content)
+                return None
+
+            # Download PDF
+            pr = self.session.get(pdf_url, timeout=30)
+            pr.raise_for_status()
+            return self._parse_pdf_bytes(pr.content)
+
+        except Exception as exc:
+            log.warning(f"  PDF fetch {url}: {exc}")
+            return None
+
+    def _parse_pdf_bytes(self, data: bytes) -> Optional[dict]:
+        """Extract text from PDF bytes and parse key fields."""
+        try:
+            import pypdf
+            reader = pypdf.PdfReader(io.BytesIO(data))
+            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        except ImportError:
+            try:
+                import pdfminer.high_level as pdfminer
+                text = pdfminer.extract_text(io.BytesIO(data))
+            except ImportError:
+                log.warning("No PDF library available — install pypdf or pdfminer.six")
+                return None
+        except Exception as exc:
+            log.warning(f"  PDF parse error: {exc}")
+            return None
+
+        if not text:
+            return None
+
+        return self._extract_fields(text)
+
+    def _extract_fields(self, text: str) -> dict:
+        """
+        Extract fields from foreclosure notice PDF text.
+        Based on actual PDF structure seen in screenshot.
+        """
+        result = {}
+
+        # ── Sale Date ────────────────────────────────────────────────────────
+        # "Date: June 02, 2026" or "Sale Date: 06/02/2026"
+        m = re.search(r"Date[:\s]+([A-Z][a-z]+ \d{1,2},?\s*\d{4})", text)
+        if m: result["sale_date"] = m.group(1).strip()
+
+        # ── Owner/Grantor ────────────────────────────────────────────────────
+        # "with ADRIENNA LUCILLE TORRES, AN UNMARRIED WOMAN, grantor(s)"
+        # or "grantor(s) NAME"
+        m = re.search(r"with\s+([A-Z][A-Z\s,\.]+?),?\s+(?:AN?\s+)?(?:UNMARRIED|MARRIED|INDIVIDUAL|TRUST|LLC|CORP)", text)
+        if m:
+            result["owner"] = m.group(1).strip().rstrip(",")
+        if not result.get("owner"):
+            m = re.search(r"([A-Z][A-Z\s]+?),?\s+grantor\(?s?\)?", text, re.I)
+            if m: result["owner"] = m.group(1).strip()
+
+        # ── Debt Amount ──────────────────────────────────────────────────────
+        # "principal amount of $199,975.00"
+        m = re.search(r"principal amount of \$([0-9,]+\.?\d*)", text, re.I)
+        if m:
+            result["amount"] = parse_amount(m.group(1))
+        if not result.get("amount"):
+            m = re.search(r"\$([0-9,]+\.?\d*)", text)
+            if m: result["amount"] = parse_amount(m.group(1))
+
+        # ── Original Deed Date ───────────────────────────────────────────────
+        # "Deed of Trust...dated June 30, 2017"
+        m = re.search(r"Deed of Trust[^.]*dated\s+([A-Z][a-z]+ \d{1,2},?\s*\d{4})", text, re.I)
+        if m: result["deed_date"] = m.group(1).strip()
+
+        # ── Lender/Mortgagee ─────────────────────────────────────────────────
+        # "U.S. BANK NATIONAL ASSOCIATION is the current mortgagee"
+        m = re.search(r"([A-Z][A-Z\s,\.]+?)\s+is the current mortgagee", text, re.I)
+        if m: result["lender"] = m.group(1).strip()
+        if not result.get("lender"):
+            m = re.search(r"Mortgagee[:\s]+([A-Z][A-Z\s,\.]+?)[\n\.]", text, re.I)
+            if m: result["lender"] = m.group(1).strip()
+
+        # ── Property Address ─────────────────────────────────────────────────
+        # Usually in "Exhibit A" or "Property to Be Sold"
+        # Common patterns: street number + street name + city + TX + zip
+        addr_patterns = [
+            r"(\d{3,5}\s+[A-Z][A-Z\s]+(?:STREET|ST|AVENUE|AVE|DRIVE|DR|ROAD|RD|LANE|LN|BLVD|BOULEVARD|WAY|COURT|CT|PLACE|PL)[.,\s]+(?:HOUSTON|HARRIS)[,\s]*(?:TEXAS|TX)[,\s]*(\d{5}))",
+            r"(\d{3,5}\s+[A-Z0-9][A-Z0-9\s#]+),?\s+(HOUSTON|HARRIS COUNTY),?\s+(TEXAS|TX),?\s+(\d{5})",
+            r"Property Address[:\s]+(.+?)(?:\n|,\s*Houston|\.|$)",
+        ]
+        for pat in addr_patterns:
+            m = re.search(pat, text, re.I)
+            if m:
+                result["address"] = m.group(1).strip()
+                result["city"]    = "Houston"
+                # Try to get zip
+                zm = re.search(r"\b(77\d{3})\b", m.group(0))
+                if zm: result["zip"] = zm.group(1)
+                break
+
+        return result if any(result.values()) else None
+
+# ─────────────────────────────────────────────────────────────────────────────
 # HCAD PARCEL DB
 # ─────────────────────────────────────────────────────────────────────────────
 class ParcelDB:
@@ -922,6 +1111,39 @@ async def main():
             seen.add(key); unique.append(r)
     records = unique
     log.info(f"Unique: {len(records)}")
+
+    # ── FRCL PDF enrichment ───────────────────────────────────────────────────
+    # Fetch each FRCL PDF to extract owner, address, amount, deed date
+    frcl_count = sum(1 for r in records if r.get("doc_type") == "FRCL")
+    if frcl_count > 0:
+        log.info(f"=== FRCL PDF enrichment ({frcl_count} records) ===")
+        try:
+            # Reuse a requests session with login cookies
+            sess = requests.Session()
+            sess.headers.update({
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            })
+            # Login via HTTP to get session cookie
+            login_url = f"{CLERK_BASE}/applications/websearch/eLogin.aspx"
+            lr = sess.get(login_url, timeout=20)
+            soup_l = BeautifulSoup(lr.text, "lxml")
+            def hidden(name):
+                el = soup_l.find("input", {"name": name})
+                return el["value"] if el and el.get("value") else ""
+            sess.post(login_url, data={
+                "__VIEWSTATE":          hidden("__VIEWSTATE"),
+                "__VIEWSTATEGENERATOR": hidden("__VIEWSTATEGENERATOR"),
+                "__EVENTVALIDATION":    hidden("__EVENTVALIDATION"),
+                "ctl00$cphMain$Login1$UserName": CLERK_USERNAME,
+                "ctl00$cphMain$Login1$Password": CLERK_PASSWORD,
+                "ctl00$cphMain$Login1$LoginButton": "Log In",
+                "UserName": CLERK_USERNAME,
+                "Password": CLERK_PASSWORD,
+            }, timeout=20)
+            enricher = FRCLPDFEnricher(sess)
+            records = enricher.enrich(records)
+        except Exception:
+            log.error(f"PDF enrichment error:\n{traceback.format_exc()}")
 
     # HCAD address enrichment
     log.info("=== HCAD parcel lookup ===")
