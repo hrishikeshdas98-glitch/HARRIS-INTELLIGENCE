@@ -362,19 +362,22 @@ class HarrisCountyScraper:
             try:
                 url = rec["clerk_url"]
                 
-                # Fix URL — correct path uses capital letters
-                # /applications/websearch/ViewECdocs → /Applications/WebSearch/ViewECdocs
-                url = re.sub(
-                    r'/applications/websearch/viewecdocs',
-                    '/Applications/WebSearch/ViewECdocs',
-                    url, flags=re.I
-                )
-                # Ensure it goes to the right host path
-                if "ViewECdocs" not in url and "viewecdocs" not in url.lower():
-                    # Try constructing from doc_num
-                    doc_num = rec.get("doc_num","")
-                    if doc_num:
-                        url = f"{CLERK_BASE}/Applications/WebSearch/ViewECdocs.aspx?DocNum={doc_num}"
+                # The stored URL is lowercase: /applications/websearch/ViewECdocs.aspx
+                # The correct working URL needs: /Applications/WebSearch/ViewECdocs.aspx
+                # Replace case-insensitively
+                if "viewecdocs" in url.lower():
+                    # Extract just the ID parameter
+                    id_match = re.search(r'[?&]ID=(.+)$', url, re.I)
+                    if id_match:
+                        doc_id = id_match.group(1)
+                        url = f"{CLERK_BASE}/Applications/WebSearch/ViewECdocs.aspx?ID={doc_id}"
+                    else:
+                        # Just fix the path
+                        url = re.sub(
+                            r'https?://[^/]+/[^?]+viewecdocs\.aspx',
+                            f'{CLERK_BASE}/Applications/WebSearch/ViewECdocs.aspx',
+                            url, flags=re.I
+                        )
                 
                 # Update the stored clerk_url with correct path
                 rec["clerk_url"] = url
