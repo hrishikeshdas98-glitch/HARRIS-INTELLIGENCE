@@ -3,7 +3,7 @@ name: Scrape Harris County Leads
 on:
   schedule:
     - cron: "0 7 * * *"   # 07:00 UTC = 02:00 CDT daily
-  workflow_dispatch:        # manual trigger
+  workflow_dispatch:
     inputs:
       frcl_year:
         description: "Foreclosure Year (e.g. 2026)"
@@ -29,13 +29,11 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      # ── Checkout ────────────────────────────────────────────────────────────
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # ── Python ──────────────────────────────────────────────────────────────
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
@@ -51,31 +49,18 @@ jobs:
       - name: Install Playwright browsers
         run: python -m playwright install --with-deps chromium
 
-      # ── Scrape ──────────────────────────────────────────────────────────────
       - name: Run scraper
         env:
           PYTHONUNBUFFERED: "1"
-          CLERK_USERNAME: ${{ secrets.CLERK_USERNAME }}
-          CLERK_PASSWORD: ${{ secrets.CLERK_PASSWORD }}
-          FRCL_YEAR:  ${{ github.event.inputs.frcl_year }}
-          FRCL_MONTH: ${{ github.event.inputs.frcl_month }}
-          LOOK_BACK_DAYS: ${{ github.event.inputs.look_back_days || '7' }}
+          CLERK_USERNAME:   ${{ secrets.CLERK_USERNAME }}
+          CLERK_PASSWORD:   ${{ secrets.CLERK_PASSWORD }}
+          FRCL_YEAR:        ${{ github.event.inputs.frcl_year }}
+          FRCL_MONTH:       ${{ github.event.inputs.frcl_month }}
+          LOOK_BACK_DAYS:   ${{ github.event.inputs.look_back_days || '7' }}
         run: |
           mkdir -p dashboard data
           python scraper/fetch.py
 
-      # ── Upload debug artifacts ───────────────────────────────────────────────
-      - name: Upload debug artifacts
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: debug-artifacts
-          path: |
-            data/debug_*.png
-            data/debug_*.html
-          if-no-files-found: ignore
-
-      # ── Commit results ───────────────────────────────────────────────────────
       - name: Commit & push records
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
@@ -84,9 +69,7 @@ jobs:
             dashboard/records.json
             data/records.json
             data/ghl_export_*.csv
-            data/debug_*.png
 
-  # ── Deploy dashboard to GitHub Pages ────────────────────────────────────────
   deploy-pages:
     needs: scrape
     runs-on: ubuntu-22.04
@@ -100,7 +83,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: main   # get the freshly-committed records.json
+          ref: main
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
