@@ -348,11 +348,9 @@ class HarrisCountyScraper:
     # ── PDF enrichment via Playwright (uses existing login session) ───────────
     async def _enrich_frcl_pdfs(self, page) -> None:
         """
-        For each FRCL record, navigate to the document viewer page
-        and extract: owner name, property address, amount, deed date.
-        
-        The PDF contains: "Commonly known as: ADDRESS CITY TX ZIP"
-        and "GRANTOR/BORROWER executed...Deed of Trust...amount of $XXX"
+        Navigate to each FRCL document viewer and extract owner/address/amount.
+        Correct viewer URL: /Applications/WebSearch/ViewECdocs.aspx?ID=...
+        (capital A/W - confirmed from browser title bar screenshot)
         """
         frcl_recs = [r for r in self.records 
                      if r.get("doc_type") == "FRCL" and r.get("clerk_url")]
@@ -364,105 +362,70 @@ class HarrisCountyScraper:
             try:
                 url = rec["clerk_url"]
                 
-                # Navigate to the document viewer
+                # Fix URL — correct path uses capital letters
+                # /applications/websearch/ViewECdocs → /Applications/WebSearch/ViewECdocs
+                url = re.sub(
+                    r'/applications/websearch/viewecdocs',
+                    '/Applications/WebSearch/ViewECdocs',
+                    url, flags=re.I
+                )
+                # Ensure it goes to the right host path
+                if "ViewECdocs" not in url and "viewecdocs" not in url.lower():
+                    # Try constructing from doc_num
+                    doc_num = rec.get("doc_num","")
+                    if doc_num:
+                        url = f"{CLERK_BASE}/Applications/WebSearch/ViewECdocs.aspx?DocNum={doc_num}"
+                
+                # Update the stored clerk_url with correct path
+                rec["clerk_url"] = url
+                
                 await page.goto(url, wait_until="domcontentloaded", timeout=20_000)
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(1)
                 
-                # Debug first record — log everything we see
-                if i == 0:
-                    log.info(f"  PDF DEBUG url: {page.url}")
-                    html = await page.content()
-                    soup_d = BeautifulSoup(html, "lxml")
-                    # Log all text
-                    text_d = " ".join(soup_d.get_text().split())[:1000]
-                    log.info(f"  PDF DEBUG page text (first 1000): {text_d}")
-                    # Log all iframes
-                    iframes = soup_d.find_all("iframe")
-                    log.info(f"  PDF DEBUG iframes: {[(f.get('src',''),f.get('id','')) for f in iframes]}")
-                    # Log all links
-                    links = [(a.get_text(strip=True)[:30], a.get("href","")[:80]) for a in soup_d.find_all("a",href=True)]
-                    log.info(f"  PDF DEBUG links: {links[:10]}")
-                    # Log any embed/object tags
-                    embeds = soup_d.find_all(["embed","object"])
-                    log.info(f"  PDF DEBUG embeds: {[(e.name, e.get('src',''),e.get('type','')) for e in embeds]}")
-                
-                # Get page text content — the viewer renders the PDF text
+                actual_url = page.url
                 content = await page.content()
                 soup = BeautifulSoup(content, "lxml")
-                text = soup.get_text("\n", strip=True)
+                text = " ".join(soup.get_text().split())
                 
-                # Also try waiting for networkidle and getting text again
-                if not text.strip() or len(text) < 100:
-                    try:
-                        await page.wait_for_load_state("networkidle", timeout=10_000)
-                        content = await page.content()
-                        soup = BeautifulSoup(content, "lxml")
-                        text = soup.get_text("\n", strip=True)
-                    except: pass
+                # Log first 3 records for debugging
+                if i < 3:
+                    log.info(f"  PDF {i+1} url={actual_url[:80]}")
+                    log.info(f"  PDF {i+1} text={text[:400]}")
                 
-                # Try to find PDF download URL from page
-                pdf_url = None
-                for a in soup.find_all("a", href=True):
-                    href = a["href"]
-                    if ".pdf" in href.lower() or "download" in href.lower():
-                        pdf_url = href if href.startswith("http") else f"{CLERK_BASE}/{href.lstrip('/')}"
-                        break
-                # Try download button
-                if not pdf_url:
-                    try:
-                        dl_btn = await page.query_selector("a[download], button:has-text('Download'), a:has-text('Download')")
-                        if dl_btn:
-                            href = await dl_btn.get_attribute("href") or ""
-                            if href:
-                                pdf_url = href if href.startswith("http") else f"{CLERK_BASE}/{href.lstrip('/')}"
-                    except: pass
-                
-                if i == 0:
-                    log.info(f"  PDF DEBUG text length: {len(text)}, pdf_url found: {pdf_url}")
-                
-                # Also try to get text from any iframe (PDF viewer)
-                iframes = await page.query_selector_all("iframe")
-                for iframe in iframes:
-                    try:
-                        frame = await iframe.content_frame()
-                        if frame:
-                            frame_html = await frame.content()
-                            frame_soup = BeautifulSoup(frame_html, "lxml")
-                            text += "\n" + frame_soup.get_text("\n", strip=True)
-                    except: continue
-
-                if not text.strip():
+                # Skip if still 404 or login page
+                if "404" in text[:100] or "cannot be found" in text[:100].lower():
+                    if i < 3:
+                        log.warning(f"  PDF {i+1}: still 404 — skipping enrichment")
                     continue
-
-                # Parse key fields from the PDF text
+                if "login" in actual_url.lower():
+                    log.warning("  PDF: session expired, stopping enrichment")
+                    break
+                
+                # Parse the page text
                 data = self._parse_frcl_pdf_text(text)
                 
                 if data:
-                    if data.get("owner"):
-                        rec["owner"]        = data["owner"]
+                    if data.get("owner"):     rec["owner"]        = data["owner"]
                     if data.get("address"):
                         rec["prop_address"] = data["address"]
-                        rec["prop_city"]    = data.get("city", "Houston")
+                        rec["prop_city"]    = data.get("city","Houston")
                         rec["prop_state"]   = "TX"
-                        rec["prop_zip"]     = data.get("zip", "")
-                    if data.get("amount"):
-                        rec["amount"]       = data["amount"]
-                    if data.get("deed_date"):
-                        rec["legal"]        = f"Deed dated: {data['deed_date']}"
-                    if data.get("lender"):
-                        rec["grantee"]      = data["lender"]
+                        rec["prop_zip"]     = data.get("zip","")
+                    if data.get("amount"):    rec["amount"]       = data["amount"]
+                    if data.get("deed_date"): rec["legal"]        = f"Deed: {data['deed_date']}"
+                    if data.get("lender"):    rec["grantee"]      = data["lender"]
                     enriched += 1
 
-                if (i + 1) % 25 == 0:
-                    log.info(f"  PDF {i+1}/{len(frcl_recs)} — {enriched} enriched so far")
+                if (i+1) % 25 == 0:
+                    log.info(f"  PDF {i+1}/{len(frcl_recs)} — {enriched} enriched")
 
-                await asyncio.sleep(0.2)  # gentle rate limit
+                await asyncio.sleep(0.3)
 
             except Exception as exc:
                 log.warning(f"  PDF {rec.get('doc_num','?')}: {exc}")
                 continue
 
-        log.info(f"  PDF enrichment done: {enriched}/{len(frcl_recs)} records enriched")
+        log.info(f"  PDF enrichment done: {enriched}/{len(frcl_recs)} enriched")
 
     def _parse_frcl_pdf_text(self, text: str) -> Optional[dict]:
         """
@@ -769,11 +732,13 @@ class HarrisCountyScraper:
             log.warning(f"    Year select: {exc}")
 
         try:
-            await page.select_option("#ctl00_ContentPlaceHolder1_ddlMonth", value=str(month_num))
+            await page.select_option("#ctl00_ContentPlaceHolder1_ddlMonth", 
+                                      value=str(month_num), timeout=5_000)
             log.info(f"    Month {month_name} ({month_num}) selected")
             await asyncio.sleep(0.3)
         except Exception as exc:
-            log.warning(f"    Month select: {exc}"); return []
+            log.info(f"    Month {month_name} not available in dropdown — skipping")
+            return []
 
         # Click Search — try multiple selectors
         for sel in ["input[value='Search']","input[value='SEARCH']",
