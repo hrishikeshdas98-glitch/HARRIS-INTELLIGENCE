@@ -277,82 +277,123 @@ class HarrisCountyScraper:
     # ── Login ─────────────────────────────────────────────────────────────────
     async def _login(self, page) -> bool:
         log.info(f"Logging in as {CLERK_USERNAME}…")
+
+        # Try login URLs in order — eLogin.aspx may be under maintenance
+        # while RP.aspx is available
+        login_urls = [
+            f"{CLERK_BASE}/Applications/WebSearch/Registration/Login.aspx",
+            f"{CLERK_BASE}/applications/websearch/eLogin.aspx",
+            CLERK_RP,  # RP.aspx is confirmed working — try logging in from here
+        ]
+
         for attempt in range(MAX_RETRIES):
-            try:
-                await page.goto(CLERK_LOGIN, wait_until="domcontentloaded", timeout=PW_TIMEOUT)
-                await asyncio.sleep(2)
+            for login_url in login_urls:
+                try:
+                    await page.goto(login_url, wait_until="domcontentloaded", timeout=PW_TIMEOUT)
+                    await asyncio.sleep(2)
 
-                # Check if portal is down
-                content = await page.content()
-                if "currently unavailable" in content.lower():
-                    log.error("Portal is currently unavailable — try again later")
-                    return False
+                    content = await page.content()
+                    lower   = content.lower()
 
-                # Fill username
-                filled = False
-                for sel in [
-                    "input[type='text']", "input[type='email']",
-                    "input[name*='User']", "input[name*='Email']",
-                    "input[id*='User']",  "input[id*='Email']",
-                ]:
-                    try:
-                        el = await page.query_selector(sel)
-                        if el and await el.is_visible():
-                            await el.click()
-                            await el.fill(CLERK_USERNAME)
-                            filled = True
-                            break
-                    except: continue
+                    # Skip if this URL is also under maintenance
+                    if "currently unavailable" in lower or "maintenance" in lower:
+                        log.warning(f"  {login_url} is under maintenance, trying next…")
+                        continue
 
-                if not filled:
-                    log.warning(f"  Attempt {attempt+1}: no username field found")
-                    await asyncio.sleep(RETRY_DELAY)
+                    # Check if there's a login form on this page
+                    has_password = await page.query_selector("input[type='password']")
+                    has_login_link = await page.query_selector("a:has-text('Log In'), a:has-text('LOGIN')")
+
+                    if has_password:
+                        # We have a login form — fill it
+                        log.info(f"  Login form found at {login_url}")
+
+                        for sel in ["input[type='text']","input[type='email']",
+                                    "input[name*='User']","input[id*='User']",
+                                    "input[name*='Email']","input[id*='Email']"]:
+                            try:
+                                el = await page.query_selector(sel)
+                                if el and await el.is_visible():
+                                    await el.fill(CLERK_USERNAME)
+                                    break
+                            except: continue
+
+                        await page.fill("input[type='password']", CLERK_PASSWORD)
+
+                        for sel in ["input[type='submit']","button[type='submit']",
+                                    "input[value*='LOG']","input[value*='Log']",
+                                    "button:has-text('Log')"]:
+                            try:
+                                el = await page.query_selector(sel)
+                                if el and await el.is_visible():
+                                    await el.click()
+                                    break
+                            except: continue
+
+                        await page.wait_for_load_state("networkidle", timeout=PW_TIMEOUT)
+                        await asyncio.sleep(2)
+
+                        body = (await page.content()).lower()
+                        url  = page.url.lower()
+
+                        if "currently unavailable" in body or "maintenance" in body:
+                            log.warning("  Maintenance page after login attempt")
+                            continue
+
+                        if any(k in body for k in ("log out","logout","sign out","my account","welcome")):
+                            log.info("Login successful ✅")
+                            return True
+
+                        if "login" not in url and "registration" not in url:
+                            log.info(f"  Login likely OK — now at {page.url}")
+                            return True
+
+                    elif has_login_link:
+                        # Click the Log In link to get to the form
+                        await has_login_link.click()
+                        await page.wait_for_load_state("networkidle", timeout=PW_TIMEOUT)
+                        await asyncio.sleep(1)
+                        # Retry this iteration with the new page
+                        has_password2 = await page.query_selector("input[type='password']")
+                        if has_password2:
+                            for sel in ["input[type='text']","input[type='email']",
+                                        "input[name*='User']","input[id*='User']"]:
+                                try:
+                                    el = await page.query_selector(sel)
+                                    if el and await el.is_visible():
+                                        await el.fill(CLERK_USERNAME)
+                                        break
+                                except: continue
+                            await page.fill("input[type='password']", CLERK_PASSWORD)
+                            for sel in ["input[type='submit']","button[type='submit']",
+                                        "input[value*='LOG']","input[value*='Log']"]:
+                                try:
+                                    el = await page.query_selector(sel)
+                                    if el and await el.is_visible():
+                                        await el.click()
+                                        break
+                                except: continue
+                            await page.wait_for_load_state("networkidle", timeout=PW_TIMEOUT)
+                            await asyncio.sleep(2)
+                            body = (await page.content()).lower()
+                            if any(k in body for k in ("log out","logout","my account")):
+                                log.info("Login successful ✅")
+                                return True
+                            if "login" not in page.url.lower():
+                                log.info(f"  Login likely OK — now at {page.url}")
+                                return True
+                    else:
+                        # No login form and no login link —
+                        # page may already be accessible without login
+                        log.info(f"  No login form at {login_url} — may be public access")
+                        return True
+
+                except Exception as exc:
+                    log.warning(f"  Login attempt {attempt+1} at {login_url}: {exc}")
                     continue
 
-                # Fill password
-                for sel in ["input[type='password']", "input[name*='Pass']", "input[id*='Pass']"]:
-                    try:
-                        el = await page.query_selector(sel)
-                        if el and await el.is_visible():
-                            await el.fill(CLERK_PASSWORD)
-                            break
-                    except: continue
-
-                # Submit
-                for sel in [
-                    "input[type='submit']", "button[type='submit']",
-                    "input[value*='LOG']",  "input[value*='Log']",
-                    "button:has-text('Log')",
-                ]:
-                    try:
-                        el = await page.query_selector(sel)
-                        if el and await el.is_visible():
-                            await el.click()
-                            break
-                    except: continue
-
-                await page.wait_for_load_state("networkidle", timeout=PW_TIMEOUT)
-                await asyncio.sleep(2)
-
-                body = (await page.content()).lower()
-                url  = page.url.lower()
-
-                if "currently unavailable" in body:
-                    log.error("Portal unavailable after login attempt")
-                    return False
-                if any(k in body for k in ("log out","logout","sign out","my account","welcome back")):
-                    log.info("Login successful ✅")
-                    return True
-                if "elogin" not in url and "login" not in url:
-                    log.info(f"Login likely OK (redirected to {page.url})")
-                    return True
-
-                log.warning(f"  Attempt {attempt+1}: still on login page")
-                await asyncio.sleep(RETRY_DELAY)
-
-            except Exception as exc:
-                log.warning(f"  Login attempt {attempt+1}: {exc}")
-                await asyncio.sleep(RETRY_DELAY)
+            log.warning(f"  All login URLs tried on attempt {attempt+1}, retrying…")
+            await asyncio.sleep(RETRY_DELAY)
 
         log.error("All login attempts failed")
         return False
@@ -372,7 +413,7 @@ class HarrisCountyScraper:
 
         # Check portal not down
         content = await page.content()
-        if "currently unavailable" in content.lower():
+        if "currently unavailable" in content.lower() and "maintenance" in content.lower():
             log.warning("  Portal unavailable during search")
             return []
 
