@@ -415,15 +415,35 @@ class HarrisCountyScraper:
                 data = self._parse_frcl_pdf_text(text)
                 
                 if data:
-                    if data.get("owner"):     rec["owner"]        = data["owner"]
+                    if data.get("owner"):        rec["owner"]        = data["owner"]
                     if data.get("address"):
                         rec["prop_address"] = data["address"]
                         rec["prop_city"]    = data.get("city","Houston")
                         rec["prop_state"]   = "TX"
                         rec["prop_zip"]     = data.get("zip","")
-                    if data.get("amount"):    rec["amount"]       = data["amount"]
-                    if data.get("deed_date"): rec["legal"]        = f"Deed: {data['deed_date']}"
-                    if data.get("lender"):    rec["grantee"]      = data["lender"]
+                    if data.get("amount"):        rec["amount"]       = data["amount"]
+                    if data.get("sale_date"):     rec["sale_date"]    = data["sale_date"]
+                    if data.get("lender"):        rec["grantee"]      = data["lender"]
+                    if data.get("legal_desc"):    rec["legal"]        = data["legal_desc"]
+                    if data.get("rp_number"):     rec["legal"]        = f"RP: {data['rp_number']} | {rec.get('legal','')}"
+                    
+                    # If no address found, look up via HCAD by owner name
+                    if not rec.get("prop_address") and data.get("owner"):
+                        addr = await self._hcad_lookup_by_owner(page, data["owner"])
+                        if addr:
+                            rec["prop_address"] = addr.get("address","")
+                            rec["prop_city"]    = addr.get("city","Houston")
+                            rec["prop_state"]   = "TX"
+                            rec["prop_zip"]     = addr.get("zip","")
+                    # Final fallback — search clerk RP by file number
+                    if not rec.get("prop_address") and data.get("rp_number"):
+                        addr = await self._hcad_lookup_by_rp(page, data["rp_number"])
+                        if addr:
+                            rec["prop_address"] = addr.get("address","")
+                            rec["prop_city"]    = addr.get("city","Houston")
+                            rec["prop_state"]   = "TX"
+                            rec["prop_zip"]     = addr.get("zip","")
+                    
                     enriched += 1
 
                 if (i+1) % 50 == 0:
@@ -439,110 +459,209 @@ class HarrisCountyScraper:
         log.info(f"  PDF enrichment done: {enriched}/{len(frcl_recs)} enriched")
 
     def _extract_pdf_text(self, pdf_bytes: bytes) -> str:
-        """Extract text from PDF bytes using pypdf."""
+        """
+        Extract text from image-based PDF using OCR.
+        These are scanned documents with no text layer.
+        """
         try:
-            import pypdf
-            reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+            import pdf2image
+            import pytesseract
+            
+            # Convert first 2 pages only (all key info is on page 1)
+            images = pdf2image.convert_from_bytes(
+                pdf_bytes,
+                dpi=200,
+                first_page=1,
+                last_page=2,
+            )
             pages = []
-            for p in reader.pages:
-                try:
-                    pages.append(p.extract_text() or "")
-                except: continue
-            return "\n".join(pages)
+            for img in images:
+                text = pytesseract.image_to_string(img, lang="eng")
+                pages.append(text)
+            result = "\n".join(pages)
+            return result
         except Exception as exc:
-            log.warning(f"  pypdf error: {exc}")
+            # Fallback to pypdf for text-layer PDFs
+            try:
+                import pypdf
+                reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+                pages = [p.extract_text() or "" for p in reader.pages]
+                return "\n".join(pages)
+            except: pass
+            log.warning(f"  PDF text extraction failed: {exc}")
             return ""
 
     def _parse_frcl_pdf_text(self, text: str) -> Optional[dict]:
         """
-        Parse text extracted from FRCL document viewer.
-        Key patterns confirmed from actual PDF:
-        - "Commonly known as: 18602 WALDEN GLEN CIR HUMBLE, TX 77346"
-        - "Kisha Dawnique Jefferson-Brown...as Grantor/Borrower"
-        - "original amount of $175,824.00"
-        - "Deed of Trust, dated 1/29/2021"
+        Parse OCR text from FRCL foreclosure notice PDFs.
+        Confirmed from actual PDF (FRCL-2026-2078):
+        - Owner: "with Enkhtuya Shen and Shaban Shen, wife and husband as Grantor(s)"
+        - Amount: "original principal amount of $271,864.00"
+        - RP#:   "Clerk's File No. RP-2021-275336"
+        - Sale:  "Date of Sale: 06/02/2026"
+        - Legal: "LOT 47, BLOCK 1, WATERSTONE SECTION 10..."
+        - Lender: "NewRez LLC is the current mortgagee"
         """
         result = {}
         if not text: return None
 
-        # ── Property Address ─────────────────────────────────────────────────
-        # "Commonly known as: ADDRESS CITY TX ZIP"
-        m = re.search(
-            r"[Cc]ommonly\s+known\s+as[:\s]+([^\n]+(?:TX|TEXAS)\s+\d{5})",
-            text, re.I
-        )
+        # ── RP File Number (for HCAD address lookup) ──────────────────────────
+        m = re.search(r"(?:File\s+No\.?|Clerk'?s?\s+File)\s+(RP-\d{4}-\d+)", text, re.I)
         if m:
-            addr_line = m.group(1).strip().rstrip(",.")
-            # Split off city/state/zip
-            addr_m = re.match(
-                r"(.+?),?\s+([A-Z][A-Z\s]+?),?\s+(?:TX|TEXAS),?\s+(\d{5})",
-                addr_line, re.I
-            )
-            if addr_m:
-                result["address"] = addr_m.group(1).strip()
-                result["city"]    = addr_m.group(2).strip().title()
-                result["zip"]     = addr_m.group(3)
-            else:
-                result["address"] = addr_line
-                result["city"]    = "Houston"
-                # Extract zip
-                zm = re.search(r"\b(77\d{3})\b", addr_line)
-                if zm: result["zip"] = zm.group(1)
+            result["rp_number"] = m.group(1).strip()
 
-        # ── Owner/Grantor ────────────────────────────────────────────────────
-        # "NAME...as Grantor/Borrower" or "NAME joined herein...as Grantor"
-        patterns = [
-            r"([A-Z][A-Za-z\s\-]+?)\s+joined\s+herein",
-            r"([A-Z][A-Za-z\s\-,]+?),?\s+as\s+Grantor[/\s]Borrower",
-            r"executed\s+and\s+delivered.*?by\s+([A-Z][A-Z\s,]+?),",
-            r"WHEREAS,\s+on\s+[\d/]+,\s+([A-Z][A-Za-z\s\-]+?)\s+(?:joined|executed)",
-        ]
-        for pat in patterns:
+        # ── Sale Date ─────────────────────────────────────────────────────────
+        m = re.search(r"Date\s+of\s+Sale[:\s]+(\d{1,2}/\d{1,2}/\d{4})", text, re.I)
+        if m:
+            result["sale_date"] = m.group(1).strip()
+
+        # ── Owner/Grantor ─────────────────────────────────────────────────────
+        for pat in [
+            # "with NAME and NAME, wife and husband as Grantor(s)"
+            r"with\s+([A-Za-z][A-Za-z\s\-]+?(?:\s+and\s+[A-Za-z\s\-]+?)?),?\s+(?:wife|husband|unmarried|married|individual|trustee)",
+            # "NAME as Grantor(s)"  
+            r"([A-Za-z][A-Za-z\s\-]+?(?:\s+and\s+[A-Za-z\s\-]+?)?)\s+as\s+Grantor",
+            # "executed by NAME and NAME securing"
+            r"executed\s+by\s+([A-Za-z][A-Za-z\s\-]+?(?:\s+and\s+[A-Za-z\s\-]+?)?)\s+securing",
+        ]:
             m = re.search(pat, text, re.I)
             if m:
-                owner = m.group(1).strip().strip(",")
-                # Clean up — remove trailing conjunctions
-                owner = re.sub(r'\s+(and|pro|forma|her|his)$', '', owner, flags=re.I)
-                if len(owner) > 3:
+                owner = re.sub(r'\s+', ' ', m.group(1).strip().strip(","))
+                if 3 < len(owner) < 80:
                     result["owner"] = owner
                     break
 
-        # ── Debt Amount ──────────────────────────────────────────────────────
+        # ── Debt Amount ───────────────────────────────────────────────────────
         for pat in [
-            r"original(?:\s+principal)?\s+amount\s+of\s+\$([0-9,]+\.?\d*)",
+            r"original\s+principal\s+amount\s+of\s+\$([0-9,]+\.?\d*)",
             r"principal\s+(?:sum|amount)\s+of\s+\$([0-9,]+\.?\d*)",
-            r"promissory\s+note.*?\$([0-9,]+\.?\d*)",
         ]:
             m = re.search(pat, text, re.I)
             if m:
-                result["amount"] = parse_amount(m.group(1))
-                break
+                amt = parse_amount(m.group(1))
+                if amt and amt > 1000:
+                    result["amount"] = amt
+                    break
 
-        # ── Deed Date ────────────────────────────────────────────────────────
-        for pat in [
-            r"Deed\s+of\s+Trust[^,]*,?\s+dated\s+([\d/]+|[A-Z][a-z]+\s+\d+,?\s*\d{4})",
-            r"executed\s+and\s+delivered.*?on\s+([\d/]+|[A-Z][a-z]+\s+\d+,?\s*\d{4})",
-            r"WHEREAS,\s+on\s+([\d/]+)",
-        ]:
-            m = re.search(pat, text, re.I)
-            if m:
-                result["deed_date"] = m.group(1).strip()
-                break
+        # ── Property Address (if "Commonly known as" present) ─────────────────
+        m = re.search(r"[Cc]ommonly\s+known\s+as[:\s]+([^\n]+(?:TX|TEXAS)\s*\d{5})", text)
+        if m:
+            addr = m.group(1).strip().rstrip(",.")
+            result["address"] = addr
+            zm = re.search(r"\b(77\d{3})\b", addr)
+            if zm: result["zip"] = zm.group(1)
+            cm = re.search(r"(.+?),?\s+(?:TX|TEXAS)", addr, re.I)
+            if cm:
+                words = cm.group(1).split()
+                if len(words) >= 2:
+                    result["city"] = words[-1].title()
 
-        # ── Lender ───────────────────────────────────────────────────────────
+        # ── Legal Description ─────────────────────────────────────────────────
+        m = re.search(r"Legal\s+Description[:\s]*\n?(LOT\s+\d+[^\n]+(?:\n[^\n]+){0,3})", text, re.I)
+        if m:
+            result["legal_desc"] = " ".join(m.group(1).split())[:200]
+
+        # ── Lender ────────────────────────────────────────────────────────────
         for pat in [
-            r"([A-Z][A-Z\s,\.]+?(?:BANK|MORTGAGE|LOAN|FINANCIAL|CREDIT)[A-Z\s,\.]*?)\s+is\s+(?:the\s+)?(?:current\s+)?mortgagee",
-            r"(?:mortgagee|lender|beneficiary)[:\s]+([A-Z][A-Z\s,\.]+?)[\n\.]",
-            r"Mortgage\s+Servicer.*?is\s+([A-Z][A-Z\s,\.]+(?:LLC|INC|CORP|NA|N\.A\.)[A-Z\s,\.]*)",
+            r"([A-Za-z][A-Za-z\s,\.]+?(?:LLC|Inc|Corp|Bank|Mortgage|N\.?A\.)[\w\s,\.]*?)\s+is\s+the\s+current\s+mortgagee",
+            r"([A-Za-z][A-Za-z\s,\.]+?(?:LLC|Inc|Corp|Bank|Mortgage)[\w\s,\.]*?)\s+is\s+(?:acting\s+as\s+)?the\s+Mortgage\s+Servicer",
         ]:
             m = re.search(pat, text, re.I)
             if m:
-                lender = m.group(1).strip().strip(",")
-                if len(lender) > 3:
+                lender = re.sub(r'\s+', ' ', m.group(1).strip().strip(","))
+                if 3 < len(lender) < 80:
                     result["lender"] = lender
                     break
 
         return result if any(result.values()) else None
+
+    async def _hcad_lookup_by_owner(self, page, owner_name: str) -> Optional[dict]:
+        """
+        Look up property address on HCAD by owner name.
+        URL: https://hcad.org/property-search/real-property/
+        Search format: "LAST FIRSTNAME" (last name first)
+        Confirmed working: "shen enkhtuya" → 22523 LAVENDER KNOLL LN, KATY, TX 77449
+        """
+        if not owner_name or len(owner_name) < 3:
+            return None
+        try:
+            # Format name for HCAD: try last-name-first
+            parts = owner_name.strip().split()
+            if len(parts) >= 2:
+                # Try "LAST FIRST" format
+                search_name = f"{parts[-1]} {parts[0]}"
+            else:
+                search_name = owner_name
+
+            url = f"https://hcad.org/property-search/real-property/?search_term={search_name.replace(' ','+')}&search_type=owner_name"
+            
+            await page.goto(url, wait_until="domcontentloaded", timeout=20_000)
+            await asyncio.sleep(1.5)
+            
+            html = await page.content()
+            soup = BeautifulSoup(html, "lxml")
+            
+            # Find results table
+            for tbl in soup.find_all("table"):
+                rows = tbl.find_all("tr")
+                for tr in rows[1:4]:  # Check first 3 results
+                    tds = tr.find_all("td")
+                    if len(tds) < 3: continue
+                    
+                    # Address is usually in the 3rd column
+                    for td in tds:
+                        txt = td.get_text(strip=True)
+                        # Look for Texas address pattern
+                        addr_m = re.search(
+                            r"(\d{3,6}\s+[A-Z][A-Z0-9\s]+(?:LN|ST|DR|RD|AVE|BLVD|WAY|CT|PL|CIR|TRL|PKWY)[,\s]+[A-Z\s]+,?\s*TX\s+\d{5})",
+                            txt, re.I
+                        )
+                        if addr_m:
+                            full_addr = addr_m.group(1).strip()
+                            # Split into parts
+                            parts_addr = full_addr.rsplit(",", 2)
+                            address = parts_addr[0].strip() if parts_addr else full_addr
+                            city = parts_addr[1].strip() if len(parts_addr) > 1 else "Houston"
+                            zip_m = re.search(r"\b(\d{5})\b", full_addr)
+                            return {
+                                "address": address,
+                                "city": city.replace("TX","").strip(),
+                                "zip": zip_m.group(1) if zip_m else "",
+                            }
+        except Exception as exc:
+            log.debug(f"  HCAD lookup {owner_name}: {exc}")
+        return None
+
+    async def _hcad_lookup_by_rp(self, page, rp_number: str) -> Optional[dict]:
+        """
+        Search the clerk RP.aspx by file number to get property address.
+        """
+        try:
+            await page.goto(CLERK_RP, wait_until="domcontentloaded", timeout=15_000)
+            await asyncio.sleep(0.5)
+            file_el = await page.query_selector("#ctl00_ContentPlaceHolder1_txtFileNo")
+            if not file_el: return None
+            await file_el.fill(rp_number)
+            btn = await page.query_selector("#ctl00_ContentPlaceHolder1_btnSearch")
+            if btn:
+                await btn.click()
+                await page.wait_for_load_state("networkidle", timeout=15_000)
+                await asyncio.sleep(0.5)
+            html = await page.content()
+            soup = BeautifulSoup(html, "lxml")
+            for tbl in soup.find_all("table"):
+                for tr in tbl.find_all("tr")[1:]:
+                    tds = tr.find_all("td")
+                    for td in tds:
+                        txt = td.get_text(strip=True)
+                        addr_m = re.search(
+                            r"(\d{3,5}\s+[A-Z][A-Z\s]+(?:ST|DR|RD|LN|AVE|BLVD|WAY|CT|PL|CIR)[A-Z\s]*)",
+                            txt, re.I
+                        )
+                        if addr_m:
+                            return {"address": addr_m.group(1).strip(), "city": "Houston", "zip": ""}
+        except Exception: pass
+        return None
 
     # ── Login ─────────────────────────────────────────────────────────────────
     async def _login(self, page) -> bool:
