@@ -450,8 +450,12 @@ class HarrisCountyScraper:
     # ── FRCL scraper — all months from frcl_month onwards ────────────────────
     async def _scrape_all_frcl_months(self, page) -> list:
         """
-        Scrape FRCL_R.aspx for the target month AND all future months available.
-        The page uses __doPostBack links for year and month selection.
+        FRCL_R.aspx actual structure (confirmed from screenshot):
+        - Year dropdown (select)
+        - Month dropdown (select)  
+        - SEARCH button
+        - Results: Doc ID | Sale Date | File Date | Pgs
+        - 486 records for June 2026 across ~49 pages (10 per page)
         """
         all_records = []
 
@@ -461,76 +465,175 @@ class HarrisCountyScraper:
         except Exception as exc:
             log.warning(f"  FRCL nav: {exc}"); return []
 
-        log.info(f"  FRCL page loaded: {page.url}")
+        log.info(f"  FRCL loaded: {page.url}")
 
-        # Get available months for our target year
-        # The page shows year links on left, month links on right
-        # First select the year
-        year_str = str(self.frcl_year)
-        try:
-            year_link = await page.query_selector(f"a:has-text('{year_str}')")
-            if year_link:
-                await year_link.click()
-                await page.wait_for_load_state("networkidle", timeout=PW_TIMEOUT)
-                await asyncio.sleep(1)
-                log.info(f"  Selected year {year_str}")
-            else:
-                log.warning(f"  Year {year_str} link not found")
-        except Exception as exc:
-            log.warning(f"  Year select: {exc}")
+        # Find all select dropdowns and log them
+        selects = await page.query_selector_all("select")
+        for sel in selects:
+            sid   = await sel.get_attribute("id") or "?"
+            sname = await sel.get_attribute("name") or "?"
+            opts  = await sel.query_selector_all("option")
+            opt_vals = []
+            for opt in opts[:15]:
+                v = await opt.get_attribute("value") or ""
+                t = (await opt.inner_text()).strip()
+                opt_vals.append(f"{v}={t}")
+            log.info(f"  Select: id={sid} name={sname} options={opt_vals}")
 
-        # Get all month links available on the page
-        html = await page.content()
-        soup = BeautifulSoup(html, "lxml")
+        # Scrape from target month onwards
+        months_to_scrape = [
+            (m, MONTH_NAMES[m]) for m in range(self.frcl_month, 13)
+        ]
 
-        # Find all month links — they appear as text like "June", "July" etc
-        available_months = []
-        for month_num, month_name in MONTH_NAMES.items():
-            # Look for this month as a clickable link
-            link = soup.find("a", string=re.compile(f"^{month_name}$", re.I))
-            if link and month_num >= self.frcl_month:
-                available_months.append((month_num, month_name))
-
-        log.info(f"  Available months from {MONTH_NAMES[self.frcl_month]}: {[m[1] for m in available_months]}")
-
-        if not available_months:
-            # Try clicking the target month directly
-            available_months = [(self.frcl_month, MONTH_NAMES[self.frcl_month])]
-
-        # Scrape each month
-        for month_num, month_name in available_months:
-            log.info(f"  Scraping FRCL: {month_name} {self.frcl_year}…")
-            month_recs = await self._scrape_frcl_month(page, month_name, month_num)
-            log.info(f"    {month_name} {self.frcl_year}: {len(month_recs)} records")
-            all_records.extend(month_recs)
+        for month_num, month_name in months_to_scrape:
+            log.info(f"  Scraping FRCL {month_name} {self.frcl_year}…")
+            recs = await self._scrape_frcl_month(page, month_name, month_num)
+            log.info(f"    {month_name} {self.frcl_year}: {len(recs)} records")
+            if recs:
+                all_records.extend(recs)
+            elif month_num > self.frcl_month:
+                # No records for this future month — stop
+                log.info(f"    No records for {month_name}, stopping")
+                break
 
         return all_records
 
     async def _scrape_frcl_month(self, page, month_name: str, month_num: int) -> list:
-        """Select a month on FRCL page and parse all records."""
-        # Make sure we're on the FRCL page with the right year selected
+        """
+        Select year+month from dropdowns, click SEARCH, paginate all results.
+        Columns: Doc ID | Sale Date | File Date | Pgs
+        """
+        # Navigate fresh to FRCL page
         try:
-            # Click the month link
-            month_link = await page.query_selector(f"a:has-text('{month_name}')")
-            if month_link:
-                await month_link.click()
-                await page.wait_for_load_state("networkidle", timeout=PW_TIMEOUT)
-                await asyncio.sleep(1.5)
-            else:
-                log.warning(f"  Month link '{month_name}' not found")
-                return []
+            await page.goto(CLERK_FRCL, wait_until="domcontentloaded", timeout=PW_TIMEOUT)
+            await asyncio.sleep(1.5)
         except Exception as exc:
-            log.warning(f"  Month click {month_name}: {exc}"); return []
+            log.warning(f"  FRCL nav for {month_name}: {exc}"); return []
 
+        year_str = str(self.frcl_year)
+
+        # Select year dropdown
+        year_selected = False
+        for sel_id in ["select[id*='Year']","select[name*='Year']","select[id*='year']"]:
+            try:
+                el = await page.query_selector(sel_id)
+                if el:
+                    # Try by value first
+                    try:
+                        await page.select_option(sel_id, value=year_str)
+                        year_selected = True
+                    except:
+                        await page.select_option(sel_id, label=year_str)
+                        year_selected = True
+                    log.info(f"    Year {year_str} selected")
+                    break
+            except: continue
+
+        if not year_selected:
+            log.warning(f"    Could not select year {year_str}")
+
+        await asyncio.sleep(0.5)
+
+        # Select month dropdown
+        month_selected = False
+        for sel_id in ["select[id*='Month']","select[name*='Month']","select[id*='month']"]:
+            try:
+                el = await page.query_selector(sel_id)
+                if el:
+                    try:
+                        await page.select_option(sel_id, label=month_name)
+                        month_selected = True
+                    except:
+                        await page.select_option(sel_id, value=str(month_num))
+                        month_selected = True
+                    log.info(f"    Month {month_name} selected")
+                    break
+            except: continue
+
+        if not month_selected:
+            log.warning(f"    Could not select month {month_name}")
+            return []
+
+        await asyncio.sleep(0.5)
+
+        # Click SEARCH button
+        search_clicked = False
+        for sel in ["input[value='SEARCH']","input[value='Search']",
+                    "button:has-text('SEARCH')","button:has-text('Search')",
+                    "input[type='submit']","button[type='submit']"]:
+            try:
+                el = await page.query_selector(sel)
+                if el and await el.is_visible():
+                    await el.click()
+                    search_clicked = True
+                    log.info(f"    Clicked search: {sel}")
+                    break
+            except: continue
+
+        if not search_clicked:
+            log.warning(f"    No search button found for {month_name}")
+            return []
+
+        await page.wait_for_load_state("networkidle", timeout=PW_TIMEOUT)
+        await asyncio.sleep(1.5)
+
+        # Check how many records found
         html = await page.content()
-        records = self._parse_frcl_table(html, month_name, month_num)
-        return records
+        soup = BeautifulSoup(html, "lxml")
+        page_text = soup.get_text()
+        rows_found = re.search(r"(\d+)\s+Row", page_text)
+        if rows_found:
+            log.info(f"    Portal reports: {rows_found.group(0)}")
+
+        # Paginate through all pages
+        all_records = []
+        page_num = 1
+
+        while True:
+            html = await page.content()
+            recs = self._parse_frcl_table(html, month_name, month_num)
+            all_records.extend(recs)
+            log.info(f"    Page {page_num}: {len(recs)} records (total: {len(all_records)})")
+
+            # Look for next page — pagination uses number links 1 2 3 ... 10 ...
+            try:
+                # Find the current active page and click the next one
+                current_page_el = await page.query_selector(
+                    "span.current-page, td.pager-current, "
+                    "a.active-page, span[style*='font-weight']"
+                )
+
+                # Try clicking the next page number
+                next_page = page_num + 1
+                next_el = await page.query_selector(
+                    f"a:has-text('{next_page}'), "
+                    f"input[value='{next_page}'], "
+                    f"td a:text-is('{next_page}')"
+                )
+
+                if not next_el:
+                    # Try "..." link for pages > 10
+                    next_el = await page.query_selector("a:has-text('...')")
+
+                if next_el:
+                    await next_el.click()
+                    await page.wait_for_load_state("networkidle", timeout=PW_TIMEOUT)
+                    await asyncio.sleep(1)
+                    page_num += 1
+                else:
+                    log.info(f"    No more pages after page {page_num}")
+                    break
+            except Exception as exc:
+                log.info(f"    Pagination ended: {exc}")
+                break
+
+        return all_records
 
     def _parse_frcl_table(self, html: str, month_name: str, month_num: int) -> list:
         """
         Parse FRCL results table.
-        Columns: Document ID | Sale Date | File Date
-        Each row also has a link to the document detail page which has the address.
+        Actual columns confirmed from screenshot:
+        [checkbox] | Doc ID | Sale Date | File Date | Pgs
         """
         soup = BeautifulSoup(html, "lxml")
         records = []
@@ -545,68 +648,53 @@ class HarrisCountyScraper:
             hdrs = [c.get_text(strip=True).lower() for c in header_cells]
             joined = " ".join(hdrs)
 
-            # FRCL table has "sale date" and "file date" headers
-            if not any(k in joined for k in ("sale","file","document","id","date")):
+            # Must have doc id + sale date + file date
+            if not ("doc" in joined and "sale" in joined and "file" in joined):
                 continue
-            if tbl.find("input") or tbl.find("select"):
+            if tbl.find("input", {"type": "text"}) or tbl.find("select"):
                 continue
 
-            log.info(f"  FRCL table: {len(rows)-1} rows, headers={hdrs}")
+            log.info(f"    FRCL table found: {len(rows)-1} rows, headers={hdrs}")
 
-            # Map columns
-            col_map = {}
-            for i, h in enumerate(hdrs):
-                if any(k in h for k in ("document","doc","id","file no","rp-")):
-                    col_map.setdefault("doc_num", i)
-                if "sale" in h and "date" in h:
-                    col_map["sale_date"] = i
-                if "file" in h and "date" in h:
-                    col_map["file_date"] = i
-                if "grantor" in h or "owner" in h or "name" in h:
-                    col_map.setdefault("owner", i)
-                if "address" in h or "property" in h:
-                    col_map.setdefault("address", i)
-                if "amount" in h or "balance" in h:
-                    col_map.setdefault("amount", i)
+            # Map exact column positions
+            col_doc  = next((i for i,h in enumerate(hdrs) if "doc" in h), 1)
+            col_sale = next((i for i,h in enumerate(hdrs) if "sale" in h), 2)
+            col_file = next((i for i,h in enumerate(hdrs) if "file" in h), 3)
 
             for tr in rows[1:]:
                 tds = tr.find_all("td")
-                if not tds: continue
+                if len(tds) < 2: continue
                 try:
+                    # Get doc ID and link
                     link = ""
+                    doc_num = ""
                     for td in tds:
                         a = td.find("a", href=True)
                         if a:
                             href = a["href"]
                             link = href if href.startswith("http") else f"{CLERK_BASE}/{href.lstrip('/')}"
+                            doc_num = a.get_text(strip=True)
                             break
 
+                    if not doc_num:
+                        doc_num = tds[col_doc].get_text(strip=True) if col_doc < len(tds) else ""
+
+                    if not doc_num or not doc_num.startswith("FRCL"):
+                        continue
+
                     def cell(i): return tds[i].get_text(strip=True) if i < len(tds) else ""
-                    def mcell(key, fallback):
-                        return cell(col_map[key]) if key in col_map else cell(fallback)
 
-                    doc_num   = mcell("doc_num", 0)
-                    sale_date = parse_date(mcell("sale_date", 1))
-                    file_date = parse_date(mcell("file_date", 2))
-                    owner     = mcell("owner", 3)
-                    address   = mcell("address", 4)
-                    amount    = parse_amount(mcell("amount", 5))
-
-                    if not doc_num: continue
+                    sale_date = parse_date(cell(col_sale))
+                    file_date = parse_date(cell(col_file))
 
                     rec = blank_rec("FRCL", "foreclosure", "Foreclosure Sale")
                     rec.update({
                         "doc_num":       doc_num,
                         "doc_type":      "FRCL",
-                        "filed":         file_date or sale_date,
+                        "filed":         file_date,
                         "sale_date":     sale_date,
                         "auction_month": auction_month,
                         "cat_label":     f"Foreclosure — {auction_month}",
-                        "owner":         owner,
-                        "prop_address":  address,
-                        "prop_city":     "Houston",
-                        "prop_state":    "TX",
-                        "amount":        amount,
                         "clerk_url":     link or CLERK_FRCL,
                     })
                     records.append(rec)
@@ -763,10 +851,18 @@ async def main():
     except Exception:
         log.error(traceback.format_exc())
 
-    # Dedup
+    # Dedup by doc_num + doc_type combo
     seen, unique = set(), []
     for r in records:
-        key = (r.get("doc_num","") or f"{r.get('owner','')}-{r.get('filed','')}").strip()
+        doc_num  = (r.get("doc_num","") or "").strip()
+        doc_type = (r.get("doc_type","") or "").strip()
+        owner    = (r.get("owner","") or "").strip()
+        filed    = (r.get("filed","") or "").strip()
+        # Use doc_num+type if available, else owner+filed
+        if doc_num:
+            key = f"{doc_num}|{doc_type}"
+        else:
+            key = f"{owner}|{filed}|{doc_type}"
         if key and key not in seen:
             seen.add(key); unique.append(r)
     records = unique
