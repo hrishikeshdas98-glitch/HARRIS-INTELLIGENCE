@@ -366,12 +366,59 @@ class HarrisCountyScraper:
                 
                 # Navigate to the document viewer
                 await page.goto(url, wait_until="domcontentloaded", timeout=20_000)
-                await asyncio.sleep(0.8)
+                await asyncio.sleep(1.5)
+                
+                # Debug first record — log everything we see
+                if i == 0:
+                    log.info(f"  PDF DEBUG url: {page.url}")
+                    html = await page.content()
+                    soup_d = BeautifulSoup(html, "lxml")
+                    # Log all text
+                    text_d = " ".join(soup_d.get_text().split())[:1000]
+                    log.info(f"  PDF DEBUG page text (first 1000): {text_d}")
+                    # Log all iframes
+                    iframes = soup_d.find_all("iframe")
+                    log.info(f"  PDF DEBUG iframes: {[(f.get('src',''),f.get('id','')) for f in iframes]}")
+                    # Log all links
+                    links = [(a.get_text(strip=True)[:30], a.get("href","")[:80]) for a in soup_d.find_all("a",href=True)]
+                    log.info(f"  PDF DEBUG links: {links[:10]}")
+                    # Log any embed/object tags
+                    embeds = soup_d.find_all(["embed","object"])
+                    log.info(f"  PDF DEBUG embeds: {[(e.name, e.get('src',''),e.get('type','')) for e in embeds]}")
                 
                 # Get page text content — the viewer renders the PDF text
                 content = await page.content()
                 soup = BeautifulSoup(content, "lxml")
                 text = soup.get_text("\n", strip=True)
+                
+                # Also try waiting for networkidle and getting text again
+                if not text.strip() or len(text) < 100:
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=10_000)
+                        content = await page.content()
+                        soup = BeautifulSoup(content, "lxml")
+                        text = soup.get_text("\n", strip=True)
+                    except: pass
+                
+                # Try to find PDF download URL from page
+                pdf_url = None
+                for a in soup.find_all("a", href=True):
+                    href = a["href"]
+                    if ".pdf" in href.lower() or "download" in href.lower():
+                        pdf_url = href if href.startswith("http") else f"{CLERK_BASE}/{href.lstrip('/')}"
+                        break
+                # Try download button
+                if not pdf_url:
+                    try:
+                        dl_btn = await page.query_selector("a[download], button:has-text('Download'), a:has-text('Download')")
+                        if dl_btn:
+                            href = await dl_btn.get_attribute("href") or ""
+                            if href:
+                                pdf_url = href if href.startswith("http") else f"{CLERK_BASE}/{href.lstrip('/')}"
+                    except: pass
+                
+                if i == 0:
+                    log.info(f"  PDF DEBUG text length: {len(text)}, pdf_url found: {pdf_url}")
                 
                 # Also try to get text from any iframe (PDF viewer)
                 iframes = await page.query_selector_all("iframe")
