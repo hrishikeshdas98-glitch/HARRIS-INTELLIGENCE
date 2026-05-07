@@ -44,7 +44,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           pip install --upgrade pip
-          pip install requests beautifulsoup4 lxml dbfread playwright
+          pip install requests beautifulsoup4 lxml dbfread playwright pypdf
 
       - name: Install Playwright browsers
         run: python -m playwright install --with-deps chromium
