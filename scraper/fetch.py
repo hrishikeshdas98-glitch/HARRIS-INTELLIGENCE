@@ -348,9 +348,9 @@ class HarrisCountyScraper:
     # ── PDF enrichment via Playwright (uses existing login session) ───────────
     async def _enrich_frcl_pdfs(self, page) -> None:
         """
-        Navigate to each FRCL document viewer and extract owner/address/amount.
-        Correct viewer URL: /Applications/WebSearch/ViewECdocs.aspx?ID=...
-        (capital A/W - confirmed from browser title bar screenshot)
+        The ViewECdocs URL serves a direct PDF download (confirmed from logs).
+        We extract cookies from Playwright, then use requests to download each PDF,
+        then parse with pypdf.
         """
         frcl_recs = [r for r in self.records 
                      if r.get("doc_type") == "FRCL" and r.get("clerk_url")]
@@ -358,53 +358,60 @@ class HarrisCountyScraper:
         log.info(f"  Enriching {len(frcl_recs)} FRCL PDFs…")
         enriched = 0
 
+        # Extract session cookies from Playwright
+        cookies = await page.context.cookies()
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": CLERK_FRCL,
+        })
+        for c in cookies:
+            session.cookies.set(c["name"], c["value"], domain=c.get("domain",""))
+
         for i, rec in enumerate(frcl_recs):
             try:
                 url = rec["clerk_url"]
                 
-                # The stored URL is lowercase: /applications/websearch/ViewECdocs.aspx
-                # The correct working URL needs: /Applications/WebSearch/ViewECdocs.aspx
-                # Replace case-insensitively
+                # Fix URL to correct path
                 if "viewecdocs" in url.lower():
-                    # Extract just the ID parameter
                     id_match = re.search(r'[?&]ID=(.+)$', url, re.I)
                     if id_match:
                         doc_id = id_match.group(1)
                         url = f"{CLERK_BASE}/Applications/WebSearch/ViewECdocs.aspx?ID={doc_id}"
-                    else:
-                        # Just fix the path
-                        url = re.sub(
-                            r'https?://[^/]+/[^?]+viewecdocs\.aspx',
-                            f'{CLERK_BASE}/Applications/WebSearch/ViewECdocs.aspx',
-                            url, flags=re.I
-                        )
-                
-                # Update the stored clerk_url with correct path
                 rec["clerk_url"] = url
+
+                # Download PDF
+                r = session.get(url, timeout=15)
                 
-                await page.goto(url, wait_until="domcontentloaded", timeout=20_000)
-                await asyncio.sleep(1)
-                
-                actual_url = page.url
-                content = await page.content()
-                soup = BeautifulSoup(content, "lxml")
-                text = " ".join(soup.get_text().split())
-                
-                # Log first 3 records for debugging
-                if i < 3:
-                    log.info(f"  PDF {i+1} url={actual_url[:80]}")
-                    log.info(f"  PDF {i+1} text={text[:400]}")
-                
-                # Skip if still 404 or login page
-                if "404" in text[:100] or "cannot be found" in text[:100].lower():
-                    if i < 3:
-                        log.warning(f"  PDF {i+1}: still 404 — skipping enrichment")
+                if r.status_code != 200:
                     continue
-                if "login" in actual_url.lower():
-                    log.warning("  PDF: session expired, stopping enrichment")
-                    break
                 
-                # Parse the page text
+                # Check it's a PDF
+                is_pdf = (
+                    "pdf" in r.headers.get("content-type","").lower() or
+                    r.content[:4] == b'%PDF'
+                )
+                
+                if i < 3:
+                    log.info(f"  PDF {i+1} ({rec.get('doc_num','?')}): "
+                             f"status={r.status_code}, "
+                             f"type={r.headers.get('content-type','?')[:30]}, "
+                             f"size={len(r.content)}, "
+                             f"is_pdf={is_pdf}, "
+                             f"first4={r.content[:4]}")
+                
+                if not is_pdf:
+                    continue
+
+                # Extract text
+                text = self._extract_pdf_text(r.content)
+                
+                if i < 3:
+                    log.info(f"  PDF {i+1} text sample: {text[:300]}")
+                
+                if not text:
+                    continue
+
                 data = self._parse_frcl_pdf_text(text)
                 
                 if data:
@@ -419,16 +426,32 @@ class HarrisCountyScraper:
                     if data.get("lender"):    rec["grantee"]      = data["lender"]
                     enriched += 1
 
-                if (i+1) % 25 == 0:
+                if (i+1) % 50 == 0:
                     log.info(f"  PDF {i+1}/{len(frcl_recs)} — {enriched} enriched")
 
-                await asyncio.sleep(0.3)
+                time.sleep(0.1)
 
             except Exception as exc:
-                log.warning(f"  PDF {rec.get('doc_num','?')}: {exc}")
+                if i < 5:
+                    log.warning(f"  PDF {rec.get('doc_num','?')}: {exc}")
                 continue
 
         log.info(f"  PDF enrichment done: {enriched}/{len(frcl_recs)} enriched")
+
+    def _extract_pdf_text(self, pdf_bytes: bytes) -> str:
+        """Extract text from PDF bytes using pypdf."""
+        try:
+            import pypdf
+            reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+            pages = []
+            for p in reader.pages:
+                try:
+                    pages.append(p.extract_text() or "")
+                except: continue
+            return "\n".join(pages)
+        except Exception as exc:
+            log.warning(f"  pypdf error: {exc}")
+            return ""
 
     def _parse_frcl_pdf_text(self, text: str) -> Optional[dict]:
         """
