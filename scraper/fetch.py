@@ -177,8 +177,10 @@ def score_record(rec: dict) -> tuple:
 def parse_rp_table(html: str, doc_code: str, cat: str, label: str) -> list:
     """
     Parse RP_R.aspx results table.
-    The table has columns: File No | Date | Grantor | Grantee | Legal Desc | ...
-    Each column is a separate <td> — we must NOT merge them.
+    Confirmed columns from screenshot:
+    [icon] | File Number | File Date | Type/Vol/Page | Names (Grantor+Grantee) | Legal Description | Pgs | Film Code
+    Names cell format: "Grantor:NAME\nGrantee:NAME"
+    Pagination uses BACK/NEXT buttons.
     """
     soup = BeautifulSoup(html, "lxml")
     records = []
@@ -186,47 +188,38 @@ def parse_rp_table(html: str, doc_code: str, cat: str, label: str) -> list:
     for tbl in soup.find_all("table"):
         rows = tbl.find_all("tr")
         if len(rows) < 2: continue
+        if tbl.find("input", {"type": "text"}) or tbl.find("select"): continue
+        if tbl.find("input", {"type": "password"}): continue
 
-        # Get headers from th or first tr
-        header_row = rows[0]
-        ths = header_row.find_all(["th","td"])
-        hdrs = [th.get_text(strip=True) for th in ths]
+        hdrs = [c.get_text(strip=True) for c in rows[0].find_all(["th","td"])]
         hdrs_lower = [h.lower() for h in hdrs]
         joined = " ".join(hdrs_lower)
 
-        # Must be a results table
-        if not any(k in joined for k in (
-            "file no","file number","grantor","instrument",
-            "record","document","filed","date"
-        )):
-            continue
+        # Identify results table
+        is_results = (
+            "file number" in joined or
+            "file date" in joined or
+            ("names" in joined and "legal" in joined) or
+            any(re.search(r"rp-\d{4}-\d+", r.get_text(), re.I) for r in rows[1:3])
+        )
+        if not is_results: continue
 
-        # Skip if it looks like the search form (has inputs inside)
-        if tbl.find("input") or tbl.find("select"):
-            continue
+        log.info(f"  RP table: {len(rows)-1} rows | headers={hdrs}")
 
-        log.info(f"  RP table: {len(rows)-1} data rows, headers={hdrs}")
-
-        # Map column indices
+        # Map column positions
         col_map = {}
         for i, h in enumerate(hdrs_lower):
-            if any(k in h for k in ("file no","file number","rp-","doc","instrument","record no")):
-                col_map.setdefault("doc_num", i)
-            if any(k in h for k in ("date","filed","recorded")):
-                col_map.setdefault("filed", i)
-            if "grantor" in h:
-                col_map["owner"] = i
-            if "grantee" in h:
-                col_map["grantee"] = i
-            if any(k in h for k in ("legal","desc","subdivision","property")):
-                col_map.setdefault("legal", i)
-            if any(k in h for k in ("amount","consideration")):
-                col_map.setdefault("amount", i)
+            if "file number" in h or "file no" in h: col_map["doc_num"] = i
+            if "file date" in h:                      col_map["filed"] = i
+            if "type" in h and "vol" in h:            col_map["type_col"] = i
+            if "name" in h:                           col_map["names"] = i
+            if "legal" in h or "desc" in h:          col_map["legal"] = i
 
         for tr in rows[1:]:
             tds = tr.find_all("td")
-            if len(tds) < 2: continue
+            if len(tds) < 3: continue
             try:
+                # Get link
                 link = ""
                 for td in tds:
                     a = td.find("a", href=True)
@@ -236,22 +229,49 @@ def parse_rp_table(html: str, doc_code: str, cat: str, label: str) -> list:
                         break
 
                 def cell(i): return tds[i].get_text(strip=True) if i < len(tds) else ""
-                def mcell(key, fallback):
-                    return cell(col_map[key]) if key in col_map else cell(fallback)
 
-                doc_num = mcell("doc_num", 0)
-                # Skip header-like rows
-                if not doc_num or doc_num in hdrs or "file no" in doc_num.lower():
-                    continue
+                # Doc number — find RP-YYYY-NNNNN
+                doc_num = ""
+                if "doc_num" in col_map:
+                    doc_num = cell(col_map["doc_num"])
+                if not doc_num:
+                    for td in tds:
+                        txt = td.get_text(strip=True)
+                        if re.match(r"RP-\d{4}-\d+", txt):
+                            doc_num = txt; break
+                if not doc_num: continue
+
+                filed = parse_date(cell(col_map.get("filed", 1)))
+
+                # Names — "Grantor:FOO BAR\nGrantee:BAZ QUX"
+                owner = ""; grantee = ""
+                names_idx = col_map.get("names", -1)
+                if names_idx >= 0:
+                    names_td = tds[names_idx]
+                    # Each name is in its own line or span
+                    names_text = names_td.get_text("\n", strip=True)
+                    g = re.search(r"Grantor:\s*(.+?)(?=\nGrantee:|\nGrantor:|$)", names_text, re.I)
+                    ge = re.search(r"Grantee:\s*(.+?)(?=\nGrantee:|\nGrantor:|$)", names_text, re.I)
+                    if g:  owner   = g.group(1).strip()
+                    if ge: grantee = ge.group(1).strip()
+                else:
+                    # Scan all tds for Grantor:/Grantee: prefixes
+                    for td in tds:
+                        for line in td.get_text("\n", strip=True).split("\n"):
+                            if line.startswith("Grantor:") and not owner:
+                                owner = line.replace("Grantor:","").strip()
+                            elif line.startswith("Grantee:") and not grantee:
+                                grantee = line.replace("Grantee:","").strip()
+
+                legal = cell(col_map.get("legal", 4))
 
                 rec = blank_rec(doc_code, cat, label)
                 rec.update({
                     "doc_num":   doc_num,
-                    "filed":     parse_date(mcell("filed", 1)),
-                    "owner":     mcell("owner", 2),
-                    "grantee":   mcell("grantee", 3),
-                    "legal":     mcell("legal", 4),
-                    "amount":    parse_amount(mcell("amount", 5)),
+                    "filed":     filed,
+                    "owner":     owner,
+                    "grantee":   grantee,
+                    "legal":     legal,
                     "clerk_url": link,
                 })
                 records.append(rec)
@@ -432,19 +452,32 @@ class HarrisCountyScraper:
             except: pass
         await asyncio.sleep(1)
 
+        # Paginate using NEXT button (confirmed from screenshot)
         all_records = []
-        for _ in range(50):
+        page_num = 1
+
+        while True:
             html = await page.content()
             rows = parse_rp_table(html, doc_code, cat, label)
             all_records.extend(rows)
+
+            # Look for NEXT button
             try:
-                nxt = await page.query_selector("a:has-text('Next'), input[value='Next']")
-                if nxt:
+                nxt = await page.query_selector(
+                    "input[value='NEXT'], input[value='Next'], "
+                    "button:has-text('NEXT'), button:has-text('Next'), "
+                    "a:has-text('NEXT'), a:has-text('Next')"
+                )
+                if nxt and await nxt.is_visible():
                     await nxt.click()
                     await page.wait_for_load_state("networkidle", timeout=PW_TIMEOUT)
                     await asyncio.sleep(0.5)
-                else: break
-            except: break
+                    page_num += 1
+                else:
+                    break
+            except Exception:
+                break
+
         return all_records
 
     # ── FRCL scraper — all months from frcl_month onwards ────────────────────
@@ -499,93 +532,63 @@ class HarrisCountyScraper:
         return all_records
 
     async def _scrape_frcl_month(self, page, month_name: str, month_num: int) -> list:
-        """
-        Select year+month from dropdowns, click SEARCH, paginate all results.
-        Columns: Doc ID | Sale Date | File Date | Pgs
-        """
-        # Navigate fresh to FRCL page
+        """Select year+month dropdowns, click Search, paginate all results."""
         try:
             await page.goto(CLERK_FRCL, wait_until="domcontentloaded", timeout=PW_TIMEOUT)
             await asyncio.sleep(1.5)
         except Exception as exc:
-            log.warning(f"  FRCL nav for {month_name}: {exc}"); return []
+            log.warning(f"  FRCL nav {month_name}: {exc}"); return []
 
         year_str = str(self.frcl_year)
 
-        # Select year dropdown
-        year_selected = False
-        for sel_id in ["select[id*='Year']","select[name*='Year']","select[id*='year']"]:
-            try:
-                el = await page.query_selector(sel_id)
-                if el:
-                    # Try by value first
-                    try:
-                        await page.select_option(sel_id, value=year_str)
-                        year_selected = True
-                    except:
-                        await page.select_option(sel_id, label=year_str)
-                        year_selected = True
-                    log.info(f"    Year {year_str} selected")
-                    break
-            except: continue
+        # Use exact IDs confirmed from logs
+        try:
+            await page.select_option("#ctl00_ContentPlaceHolder1_ddlYear", value=year_str)
+            log.info(f"    Year {year_str} selected")
+            await asyncio.sleep(0.3)
+        except Exception as exc:
+            log.warning(f"    Year select: {exc}")
 
-        if not year_selected:
-            log.warning(f"    Could not select year {year_str}")
+        try:
+            await page.select_option("#ctl00_ContentPlaceHolder1_ddlMonth", value=str(month_num))
+            log.info(f"    Month {month_name} ({month_num}) selected")
+            await asyncio.sleep(0.3)
+        except Exception as exc:
+            log.warning(f"    Month select: {exc}"); return []
 
-        await asyncio.sleep(0.5)
-
-        # Select month dropdown
-        month_selected = False
-        for sel_id in ["select[id*='Month']","select[name*='Month']","select[id*='month']"]:
-            try:
-                el = await page.query_selector(sel_id)
-                if el:
-                    try:
-                        await page.select_option(sel_id, label=month_name)
-                        month_selected = True
-                    except:
-                        await page.select_option(sel_id, value=str(month_num))
-                        month_selected = True
-                    log.info(f"    Month {month_name} selected")
-                    break
-            except: continue
-
-        if not month_selected:
-            log.warning(f"    Could not select month {month_name}")
-            return []
-
-        await asyncio.sleep(0.5)
-
-        # Click SEARCH button
-        search_clicked = False
-        for sel in ["input[value='SEARCH']","input[value='Search']",
-                    "button:has-text('SEARCH')","button:has-text('Search')",
-                    "input[type='submit']","button[type='submit']"]:
+        # Click Search — try multiple selectors
+        for sel in ["input[value='Search']","input[value='SEARCH']",
+                    "button:has-text('Search')","input[type='submit']"]:
             try:
                 el = await page.query_selector(sel)
                 if el and await el.is_visible():
                     await el.click()
-                    search_clicked = True
-                    log.info(f"    Clicked search: {sel}")
+                    log.info(f"    Clicked: {sel}")
                     break
             except: continue
-
-        if not search_clicked:
-            log.warning(f"    No search button found for {month_name}")
-            return []
 
         await page.wait_for_load_state("networkidle", timeout=PW_TIMEOUT)
         await asyncio.sleep(1.5)
 
-        # Check how many records found
+        # Check rows found
         html = await page.content()
         soup = BeautifulSoup(html, "lxml")
-        page_text = soup.get_text()
-        rows_found = re.search(r"(\d+)\s+Row", page_text)
-        if rows_found:
-            log.info(f"    Portal reports: {rows_found.group(0)}")
+        page_text = " ".join(soup.get_text().split())
+        rows_match = re.search(r"(\d+)\s+Row", page_text)
+        if rows_match:
+            log.info(f"    Portal: {rows_match.group(0)}")
 
-        # Paginate through all pages
+        # Log ALL tables to find the results one
+        tables = soup.find_all("table")
+        log.info(f"    Tables found: {len(tables)}")
+        for i, tbl in enumerate(tables):
+            rows = tbl.find_all("tr")
+            if not rows: continue
+            hdrs = [c.get_text(strip=True) for c in rows[0].find_all(["th","td"])]
+            sample = [c.get_text(strip=True) for c in rows[1].find_all("td")] if len(rows)>1 else []
+            log.info(f"    Table {i}: {len(rows)} rows | headers={hdrs} | sample={sample[:4]}")
+
+        # Paginate
         all_records = []
         page_num = 1
 
@@ -593,47 +596,60 @@ class HarrisCountyScraper:
             html = await page.content()
             recs = self._parse_frcl_table(html, month_name, month_num)
             all_records.extend(recs)
-            log.info(f"    Page {page_num}: {len(recs)} records (total: {len(all_records)})")
+            log.info(f"    Page {page_num}: {len(recs)} records (total {len(all_records)})")
 
-            # Look for next page — pagination uses number links 1 2 3 ... 10 ...
+            # Find pagination — look for page number links in a pager row
+            # The page uses number links: 1 2 3 ... 10 ...
+            next_page = page_num + 1
+            next_found = False
+
+            # Try clicking next page number directly
             try:
-                # Find the current active page and click the next one
-                current_page_el = await page.query_selector(
-                    "span.current-page, td.pager-current, "
-                    "a.active-page, span[style*='font-weight']"
-                )
-
-                # Try clicking the next page number
-                next_page = page_num + 1
-                next_el = await page.query_selector(
-                    f"a:has-text('{next_page}'), "
-                    f"input[value='{next_page}'], "
-                    f"td a:text-is('{next_page}')"
-                )
-
+                # Look for the next page number as a link
+                next_el = await page.query_selector(f"a:text-is('{next_page}')")
                 if not next_el:
-                    # Try "..." link for pages > 10
-                    next_el = await page.query_selector("a:has-text('...')")
+                    # Try within table cells
+                    next_el = await page.query_selector(f"td > a:has-text('{next_page}')")
+                if not next_el:
+                    # Try span containing the link
+                    next_el = await page.query_selector(f"span > a:has-text('{next_page}')")
 
                 if next_el:
-                    await next_el.click()
-                    await page.wait_for_load_state("networkidle", timeout=PW_TIMEOUT)
-                    await asyncio.sleep(1)
-                    page_num += 1
-                else:
-                    log.info(f"    No more pages after page {page_num}")
-                    break
+                    is_visible = await next_el.is_visible()
+                    if is_visible:
+                        await next_el.click()
+                        await page.wait_for_load_state("networkidle", timeout=PW_TIMEOUT)
+                        await asyncio.sleep(0.8)
+                        page_num += 1
+                        next_found = True
+                    else:
+                        # Page number exists but not visible — may need "..." first
+                        dots = await page.query_selector("a:has-text('...')")
+                        if dots:
+                            await dots.click()
+                            await page.wait_for_load_state("networkidle", timeout=15_000)
+                            await asyncio.sleep(0.8)
+                            # Now try the page number again
+                            next_el2 = await page.query_selector(f"a:text-is('{next_page}')")
+                            if next_el2 and await next_el2.is_visible():
+                                await next_el2.click()
+                                await page.wait_for_load_state("networkidle", timeout=PW_TIMEOUT)
+                                await asyncio.sleep(0.8)
+                                page_num += 1
+                                next_found = True
             except Exception as exc:
-                log.info(f"    Pagination ended: {exc}")
+                log.info(f"    Pagination page {next_page}: {exc}")
+
+            if not next_found:
+                log.info(f"    No more pages after {page_num}")
                 break
 
         return all_records
 
     def _parse_frcl_table(self, html: str, month_name: str, month_num: int) -> list:
         """
-        Parse FRCL results table.
-        Actual columns confirmed from screenshot:
-        [checkbox] | Doc ID | Sale Date | File Date | Pgs
+        Parse FRCL results.
+        Confirmed columns: [icon] | Doc ID (FRCL-YYYY-NNNN) | Sale Date | File Date | Pgs
         """
         soup = BeautifulSoup(html, "lxml")
         records = []
@@ -643,62 +659,101 @@ class HarrisCountyScraper:
             rows = tbl.find_all("tr")
             if len(rows) < 2: continue
 
-            # Get headers
-            header_cells = rows[0].find_all(["th","td"])
-            hdrs = [c.get_text(strip=True).lower() for c in header_cells]
-            joined = " ".join(hdrs)
-
-            # Must have doc id + sale date + file date
-            if not ("doc" in joined and "sale" in joined and "file" in joined):
-                continue
+            # Skip form/nav tables
             if tbl.find("input", {"type": "text"}) or tbl.find("select"):
                 continue
+            if tbl.find("input", {"type": "password"}):
+                continue
 
-            log.info(f"    FRCL table found: {len(rows)-1} rows, headers={hdrs}")
+            # Check if any cell in first 3 rows contains an FRCL- doc ID
+            # This is the most reliable way to identify the results table
+            has_frcl = False
+            for tr in rows[:5]:
+                for td in tr.find_all(["td","th"]):
+                    txt = td.get_text(strip=True)
+                    if re.match(r"FRCL-\d{4}-\d+", txt):
+                        has_frcl = True
+                        break
+                    a = td.find("a")
+                    if a and re.match(r"FRCL-\d{4}-\d+", a.get_text(strip=True)):
+                        has_frcl = True
+                        break
 
-            # Map exact column positions
-            col_doc  = next((i for i,h in enumerate(hdrs) if "doc" in h), 1)
-            col_sale = next((i for i,h in enumerate(hdrs) if "sale" in h), 2)
-            col_file = next((i for i,h in enumerate(hdrs) if "file" in h), 3)
+            # Also accept tables with "Doc ID" / "Sale Date" headers
+            hdrs = [c.get_text(strip=True).lower() for c in rows[0].find_all(["th","td"])]
+            has_headers = ("doc" in " ".join(hdrs) and "sale" in " ".join(hdrs))
 
-            for tr in rows[1:]:
+            if not has_frcl and not has_headers:
+                continue
+
+            log.info(f"    FRCL results table: {len(rows)-1} data rows | headers={hdrs}")
+
+            # Find column positions
+            col_sale = next((i for i,h in enumerate(hdrs) if "sale" in h), -1)
+            col_file = next((i for i,h in enumerate(hdrs) if "file" in h and "date" in h), -1)
+            if col_file == -1:
+                col_file = next((i for i,h in enumerate(hdrs) if "file" in h), -1)
+
+            for tr in rows:
                 tds = tr.find_all("td")
-                if len(tds) < 2: continue
-                try:
-                    # Get doc ID and link
-                    link = ""
-                    doc_num = ""
-                    for td in tds:
-                        a = td.find("a", href=True)
-                        if a:
+                if not tds: continue
+
+                # Find FRCL doc ID — look for link with FRCL- pattern
+                doc_num = ""
+                link    = ""
+                for td in tds:
+                    a = td.find("a", href=True)
+                    if a:
+                        txt = a.get_text(strip=True)
+                        if re.match(r"FRCL-", txt):
+                            doc_num = txt
                             href = a["href"]
                             link = href if href.startswith("http") else f"{CLERK_BASE}/{href.lstrip('/')}"
-                            doc_num = a.get_text(strip=True)
                             break
+                    # Also check td text directly
+                    txt = td.get_text(strip=True)
+                    if re.match(r"FRCL-\d{4}-\d+", txt):
+                        doc_num = txt
+                        break
 
-                    if not doc_num:
-                        doc_num = tds[col_doc].get_text(strip=True) if col_doc < len(tds) else ""
+                if not doc_num:
+                    continue
 
-                    if not doc_num or not doc_num.startswith("FRCL"):
-                        continue
+                def cell(i):
+                    return tds[i].get_text(strip=True) if 0 <= i < len(tds) else ""
 
-                    def cell(i): return tds[i].get_text(strip=True) if i < len(tds) else ""
-
+                # Get dates — use column mapping if available, else try positions 1,2,3
+                sale_date = ""
+                file_date = ""
+                if col_sale >= 0:
                     sale_date = parse_date(cell(col_sale))
+                if col_file >= 0:
                     file_date = parse_date(cell(col_file))
 
-                    rec = blank_rec("FRCL", "foreclosure", "Foreclosure Sale")
-                    rec.update({
-                        "doc_num":       doc_num,
-                        "doc_type":      "FRCL",
-                        "filed":         file_date,
-                        "sale_date":     sale_date,
-                        "auction_month": auction_month,
-                        "cat_label":     f"Foreclosure — {auction_month}",
-                        "clerk_url":     link or CLERK_FRCL,
-                    })
-                    records.append(rec)
-                except: continue
+                # Fallback: scan all cells for date patterns
+                if not sale_date or not file_date:
+                    dates_found = []
+                    for td in tds:
+                        txt = td.get_text(strip=True)
+                        d = parse_date(txt)
+                        if d: dates_found.append(d)
+                    if len(dates_found) >= 2:
+                        sale_date = sale_date or dates_found[0]
+                        file_date = file_date or dates_found[1]
+                    elif len(dates_found) == 1:
+                        sale_date = sale_date or dates_found[0]
+
+                rec = blank_rec("FRCL", "foreclosure", "Foreclosure Sale")
+                rec.update({
+                    "doc_num":       doc_num,
+                    "doc_type":      "FRCL",
+                    "filed":         file_date,
+                    "sale_date":     sale_date,
+                    "auction_month": auction_month,
+                    "cat_label":     f"Foreclosure — {auction_month}",
+                    "clerk_url":     link or CLERK_FRCL,
+                })
+                records.append(rec)
 
         return records
 
