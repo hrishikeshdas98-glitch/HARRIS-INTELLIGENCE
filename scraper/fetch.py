@@ -180,41 +180,93 @@ def parse_results_table(html: str, doc_code: str, cat: str, label: str) -> list:
     """Parse results table from HTML page."""
     soup = BeautifulSoup(html, "lxml")
     records = []
-    for tbl in soup.find_all("table"):
-        ths = tbl.find_all("th")
-        if not ths:
+
+    # Log ALL tables found for debugging
+    all_tables = soup.find_all("table")
+    log.info(f"  parse_results_table: found {len(all_tables)} tables on page")
+    for i, tbl in enumerate(all_tables):
+        ths = [th.get_text(strip=True) for th in tbl.find_all("th")]
+        tds = tbl.find_all("tr")
+        log.info(f"    Table {i}: {len(tds)} rows, headers={ths[:8]}")
+
+    for tbl in all_tables:
+        ths  = tbl.find_all("th")
+        rows = tbl.find_all("tr")
+
+        # Skip tables with fewer than 2 rows (no data)
+        if len(rows) < 2:
             continue
+
+        # Skip tiny tables (form labels etc)
+        if len(rows) < 3 and not ths:
+            continue
+
         hdrs = [th.get_text(strip=True).lower() for th in ths]
         joined = " ".join(hdrs)
-        if not any(k in joined for k in ("file","grantor","instrument","doc","name","date","type","number")):
-            continue
-        log.info(f"  Results table found — headers: {hdrs[:8]}")
-        for tr in tbl.find_all("tr")[1:]:
-            tds = tr.find_all("td")
-            if len(tds) < 2:
+
+        # Must look like a real results table with data columns
+        # Reject form-label tables (File No, Grantor, Grantee as row labels)
+        if any(k in joined for k in (
+            "file no","file number","instrument","grantor","grantee",
+            "filed","date filed","doc number","document number",
+            "record date","book","volume"
+        )):
+            # Make sure it has actual data rows (td cells with real content)
+            data_rows = []
+            for tr in rows[1:]:
+                tds = tr.find_all("td")
+                # A real data row has multiple cells with actual text
+                cells = [td.get_text(strip=True) for td in tds if td.get_text(strip=True)]
+                if len(cells) >= 3:
+                    data_rows.append((tds, cells))
+
+            if not data_rows:
                 continue
-            try:
-                link = ""
-                for td in tds:
-                    a = td.find("a", href=True)
-                    if a:
-                        href = a["href"]
-                        link = href if href.startswith("http") else f"{CLERK_BASE}/{href.lstrip('/')}"
-                        break
-                def cell(i): return tds[i].get_text(strip=True) if i < len(tds) else ""
-                rec = blank_rec(doc_code, cat, label)
-                rec.update({
-                    "doc_num":   cell(0),
-                    "filed":     parse_date(cell(1)),
-                    "owner":     cell(2),
-                    "grantee":   cell(3),
-                    "legal":     cell(4),
-                    "amount":    parse_amount(cell(5)),
-                    "clerk_url": link,
-                })
-                if rec["doc_num"]:
-                    records.append(rec)
-            except: continue
+
+            log.info(f"  Results table matched — headers: {hdrs[:8]}, data rows: {len(data_rows)}")
+
+            # Map header positions
+            col = {}
+            for i, h in enumerate(hdrs):
+                if any(k in h for k in ("file","doc","number","instrument","record")): col.setdefault("doc_num", i)
+                if any(k in h for k in ("date","filed","record date")):                col.setdefault("filed", i)
+                if any(k in h for k in ("grantor","owner","name")):                    col.setdefault("owner", i)
+                if any(k in h for k in ("grantee",)):                                  col.setdefault("grantee", i)
+                if any(k in h for k in ("legal","desc","subdivision","property")):     col.setdefault("legal", i)
+                if any(k in h for k in ("amount","consideration","price")):            col.setdefault("amount", i)
+
+            for tds, cells in data_rows:
+                try:
+                    link = ""
+                    for td in tds:
+                        a = td.find("a", href=True)
+                        if a:
+                            href = a["href"]
+                            link = href if href.startswith("http") else f"{CLERK_BASE}/{href.lstrip('/')}"
+                            break
+
+                    def cell(i): return tds[i].get_text(strip=True) if i < len(tds) else ""
+                    def mapped(key, fallback_idx):
+                        return cell(col[key]) if key in col else cell(fallback_idx)
+
+                    rec = blank_rec(doc_code, cat, label)
+                    rec.update({
+                        "doc_num":   mapped("doc_num", 0),
+                        "filed":     parse_date(mapped("filed", 1)),
+                        "owner":     mapped("owner", 2),
+                        "grantee":   mapped("grantee", 3),
+                        "legal":     mapped("legal", 4),
+                        "amount":    parse_amount(mapped("amount", 5)),
+                        "clerk_url": link,
+                    })
+                    if rec["doc_num"] and rec["doc_num"] not in (
+                        "File No:", "ID:", "Grantor:", "Grantee:",
+                        "Desc:", "Sec:", "Lot:", "Block:", "Unit:"
+                    ):
+                        records.append(rec)
+                except Exception:
+                    continue
+
     return records
 
 # ─────────────────────────────────────────────────────────────────────────────
