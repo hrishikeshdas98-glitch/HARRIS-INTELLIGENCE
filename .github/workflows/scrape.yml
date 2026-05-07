@@ -41,10 +41,15 @@ jobs:
           cache: pip
           cache-dependency-path: scraper/requirements.txt
 
+      - name: Install system dependencies (OCR)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q tesseract-ocr poppler-utils
+
       - name: Install Python dependencies
         run: |
           pip install --upgrade pip
-          pip install requests beautifulsoup4 lxml dbfread playwright pypdf
+          pip install requests beautifulsoup4 lxml dbfread playwright pypdf pdfplumber pdf2image pytesseract Pillow
 
       - name: Install Playwright browsers
         run: python -m playwright install --with-deps chromium
