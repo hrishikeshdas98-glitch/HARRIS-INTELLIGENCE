@@ -145,26 +145,27 @@ def is_valid_property_address(addr: str) -> bool:
     if not addr or len(addr) < 10: return False
     addr_lower = addr.lower()
     
-    # Must have a Harris County zip (770xx-778xx) 
-    # or be a known Houston suburb (Katy=774, Humble=773, etc.)
-    zip_m = re.search(r'\b(\d{5})\b', addr)
+    # Must have a Harris County zip (770xx-778xx) OR no zip at all (zip checked separately)
+    # Look for zip specifically at end or after TX/TEXAS — not house numbers
+    zip_m = re.search(r'(?:TX|TEXAS)[,\s]+(\d{5})\b', addr, re.I)
     if zip_m:
         z = zip_m.group(1)
-        # Texas zips for Harris County and immediate suburbs
         if not z.startswith(('770','771','772','773','774','775','776','777','778')):
-            return False  # Dallas, Austin, etc.
+            return False  # Dallas, Austin, California etc.
     
     # Reject known garbage patterns
     bad_patterns = [
         "certificate of posting", "p.o. box", "po box",
-        "suite", "14160 dallas", "state highway 249",
+        "14160 dallas", "state highway 249",
         "beattie place", "tamarack road", "college blvd",
+        "huntington beach", "anaheim", "california",
+        "greenville, sc", "orange, ca",
     ]
     if any(p in addr_lower for p in bad_patterns):
         return False
     
-    # Must start with a number (house number)
-    if not re.match(r'^\d{2,6}\s+[A-Z]', addr, re.I):
+    # Must start with a house number
+    if not re.match(r'^\d{2,6}\s+[A-Za-z]', addr):
         return False
     
     return True
@@ -1251,13 +1252,8 @@ class HarrisCountyScraper:
                     elif len(dates_found) == 1:
                         sale_date = sale_date or dates_found[0]
 
-                # Build a public-accessible URL using the document ID search
-                # The FRCL page with doc ID pre-filled works without login
-                frcl_year = doc_num.split("-")[1] if "-" in doc_num else str(self.frcl_year)
-                public_url = (
-                    f"https://www.cclerk.hctx.net/applications/websearch/FRCL_R.aspx"
-                    f"?DocID={doc_num}"
-                )
+                # Public URL: FRCL search page with document ID pre-filled
+                public_url = f"https://www.cclerk.hctx.net/applications/websearch/FRCL_R.aspx"
                 rec = blank_rec("FRCL", "foreclosure", "Foreclosure Sale")
                 rec.update({
                     "doc_num":       doc_num,
@@ -1266,8 +1262,8 @@ class HarrisCountyScraper:
                     "sale_date":     sale_date,
                     "auction_month": auction_month,
                     "cat_label":     f"Foreclosure — {auction_month}",
-                    "clerk_url":     link or public_url,
-                    "_pdf_url":      link,  # Store original for PDF download
+                    "clerk_url":     public_url,
+                    "_pdf_url":      link,  # authenticated URL for PDF download
                 })
                 records.append(rec)
 
