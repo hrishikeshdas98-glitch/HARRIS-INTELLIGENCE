@@ -137,12 +137,43 @@ def name_variants(name: str) -> list:
             variants.add(f"{parts[-1]} {' '.join(parts[:-1])}")
     return list(variants)
 
-def blank_rec(doc_code, cat, label) -> dict:
+def is_valid_property_address(addr: str) -> bool:
+    """
+    Reject addresses that are clearly law firm offices, servicers, or OCR garbage.
+    Harris County property zips start with 770-778.
+    """
+    if not addr or len(addr) < 10: return False
+    addr_lower = addr.lower()
+    
+    # Must have a Harris County zip (770xx-778xx) 
+    # or be a known Houston suburb (Katy=774, Humble=773, etc.)
+    zip_m = re.search(r'\b(\d{5})\b', addr)
+    if zip_m:
+        z = zip_m.group(1)
+        # Texas zips for Harris County and immediate suburbs
+        if not z.startswith(('770','771','772','773','774','775','776','777','778')):
+            return False  # Dallas, Austin, etc.
+    
+    # Reject known garbage patterns
+    bad_patterns = [
+        "certificate of posting", "p.o. box", "po box",
+        "suite", "14160 dallas", "state highway 249",
+        "beattie place", "tamarack road", "college blvd",
+    ]
+    if any(p in addr_lower for p in bad_patterns):
+        return False
+    
+    # Must start with a number (house number)
+    if not re.match(r'^\d{2,6}\s+[A-Z]', addr, re.I):
+        return False
+    
+    return True
     return {
         "doc_num": "", "doc_type": doc_code, "filed": "",
         "cat": cat, "cat_label": CAT_LABELS.get(cat, label),
         "owner": "", "grantee": "", "amount": None, "legal": "",
-        "sale_date": "",  # auction date for foreclosures
+        "sale_date": "",   # auction date
+        "deed_date": "",   # original deed of trust date
         "auction_month": "",  # e.g. "June 2026"
         "prop_address": "", "prop_city": "Houston",
         "prop_state": "TX", "prop_zip": "",
@@ -430,12 +461,13 @@ class HarrisCountyScraper:
                     if data.get("owner"):     rec["owner"]        = data["owner"]
                     if data.get("amount"):    rec["amount"]       = data["amount"]
                     if data.get("sale_date"): rec["sale_date"]    = data["sale_date"]
+                    if data.get("deed_date"): rec["deed_date"]    = data["deed_date"]
                     if data.get("lender"):    rec["grantee"]      = data["lender"]
                     if data.get("legal_desc"):rec["legal"]        = data["legal_desc"]
                     if data.get("rp_number"): rec["legal"]        = f"RP: {data['rp_number']} | {rec.get('legal','')}"
 
-                    # Set address from PDF if found
-                    if data.get("address"):
+                    # Set address from PDF if valid (rejects law firm addresses)
+                    if data.get("address") and is_valid_property_address(data["address"]):
                         rec["prop_address"] = data["address"]
                         rec["prop_city"]    = data.get("city","Houston")
                         rec["prop_state"]   = "TX"
@@ -444,7 +476,7 @@ class HarrisCountyScraper:
                     # HCAD lookup by owner name if no address found
                     if not rec.get("prop_address") and data.get("owner"):
                         addr = await self._hcad_lookup_by_owner(page, data["owner"])
-                        if addr:
+                        if addr and is_valid_property_address(addr.get("address","")):
                             rec["prop_address"] = addr.get("address","")
                             rec["prop_city"]    = addr.get("city","Houston")
                             rec["prop_state"]   = "TX"
@@ -453,7 +485,7 @@ class HarrisCountyScraper:
                     # Final fallback — clerk RP search
                     if not rec.get("prop_address") and data.get("rp_number"):
                         addr = await self._hcad_lookup_by_rp(page, data["rp_number"])
-                        if addr:
+                        if addr and is_valid_property_address(addr.get("address","")):
                             rec["prop_address"] = addr.get("address","")
                             rec["prop_city"]    = addr.get("city","Houston")
                             rec["prop_state"]   = "TX"
@@ -478,44 +510,44 @@ class HarrisCountyScraper:
 
     def _extract_pdf_text(self, pdf_bytes: bytes) -> str:
         """
-        Extract text from image-based PDF using OCR.
-        These are scanned documents with no text layer.
+        Extract text from image-based PDF using OCR with preprocessing.
+        The UNOFFICIAL COPY watermark corrupts OCR — we enhance contrast first.
         """
         try:
             import pdf2image
             import pytesseract
-            
-            # 150 DPI is sufficient for these docs and 2x faster than 200
-            images = pdf2image.convert_from_bytes(
-                pdf_bytes,
-                dpi=150,
-                first_page=1,
-                last_page=1,  # Page 1 has all key info
-            )
-            pages = []
-            for img in images:
-                text = pytesseract.image_to_string(img, lang="eng")
-                pages.append(text)
-            result = "\n".join(pages)
-            # If address not found on page 1, check page 2
-            if result and "commonly known" not in result.lower() and \
-               not re.search(r"\d{4,5}\s+[A-Z].*\bTX\b", result):
+            from PIL import ImageFilter, ImageEnhance
+
+            def ocr_page(img):
+                # Convert to grayscale
+                img = img.convert("L")
+                # Boost contrast to make black text stand out over grey watermark
+                img = ImageEnhance.Contrast(img).enhance(2.5)
+                # Sharpen edges
+                img = img.filter(ImageFilter.SHARPEN)
+                return pytesseract.image_to_string(img, lang="eng", config="--psm 6 --oem 3")
+
+            # Page 1 at 200 DPI
+            images = pdf2image.convert_from_bytes(pdf_bytes, dpi=200, first_page=1, last_page=1)
+            result = ocr_page(images[0]) if images else ""
+
+            # Check page 2 if no "commonly known as" found
+            if result and "commonly known" not in result.lower():
                 try:
-                    imgs2 = pdf2image.convert_from_bytes(
-                        pdf_bytes, dpi=150, first_page=2, last_page=2)
+                    imgs2 = pdf2image.convert_from_bytes(pdf_bytes, dpi=200, first_page=2, last_page=2)
                     if imgs2:
-                        result += "\n" + pytesseract.image_to_string(imgs2[0], lang="eng")
+                        result += "\n" + ocr_page(imgs2[0])
                 except: pass
+
             return result
+
         except Exception as exc:
-            # Fallback to pypdf for text-layer PDFs
             try:
                 import pypdf
                 reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
-                pages = [p.extract_text() or "" for p in reader.pages]
-                return "\n".join(pages)
+                return "\n".join(p.extract_text() or "" for p in reader.pages)
             except: pass
-            log.warning(f"  PDF text extraction failed: {exc}")
+            log.warning(f"  PDF extraction failed: {exc}")
             return ""
 
     def _parse_frcl_pdf_text(self, text: str) -> Optional[dict]:
@@ -591,26 +623,63 @@ class HarrisCountyScraper:
         )
         if m:
             addr = m.group(1).strip().rstrip(",.")
-            result["address"] = addr
-            zm = re.search(r"\b(7[0-9]{4})\b", addr)
-            if zm: result["zip"] = zm.group(1)
-            cm = re.search(r"(.+?),?\s+(?:TX|TEXAS)", addr, re.I)
-            if cm:
-                words = cm.group(1).strip().split()
-                result["city"] = words[-1].title() if words else "Houston"
+            if is_valid_property_address(addr):
+                result["address"] = addr
+                zm = re.search(r"\b(7[0-9]{4})\b", addr)
+                if zm: result["zip"] = zm.group(1)
+                cm = re.search(r"(.+?),?\s+(?:TX|TEXAS)", addr, re.I)
+                if cm:
+                    words = cm.group(1).strip().split()
+                    result["city"] = words[-1].title() if words else "Houston"
 
-        # Pattern 2: Header address block (2-line: street \n city, TX zip)
-        # e.g. "11603 DOWNEY VIOLET LN 00000010704641\nHOUSTON, TX 77044"
-        # Note: [^\n]* handles trailing barcode numbers after street type
+        # Pattern 2: Header address - street and city may have 1-2 lines between them
+        # e.g. "11603 DOWNEY VIOLET LN 00000010704641\nNOTICE OF...\nHOUSTON, TX 77044"
         if not result.get("address"):
             m = re.search(
-                r"(\d{3,6}\s+[A-Z0-9][A-Z0-9\s#\.]+(?:LN|ST|AVE|DR|RD|BLVD|WAY|CT|PL|CIR|TRL|PKWY|LOOP|PASS|RUN|ROW|TER|TRCE|VW|XING|HWY|FWY))[^\n]*\n\s*([A-Z][A-Z\s]+?),?\s*TX\s+(\d{5})",
+                r"(\d{3,6}\s+[A-Z0-9][A-Z0-9\s#\.]+(?:LN|ST|AVE|DR|RD|BLVD|WAY|CT|PL|CIR|TRL|PKWY|LOOP|PASS|RUN|ROW|TER|TRCE|VW|XING|HWY|FWY))[^\n]*\n(?:[^\n]*\n){0,3}?\s*([A-Z][A-Z\s]+?),?\s*TX\s+(\d{5})",
                 text, re.I
             )
             if m:
-                result["address"] = m.group(1).strip()
-                result["city"]    = m.group(2).strip().title()
-                result["zip"]     = m.group(3)
+                candidate = f"{m.group(1).strip()}, {m.group(2).strip()}, TX {m.group(3)}"
+                if is_valid_property_address(candidate):
+                    result["address"] = m.group(1).strip()
+                    result["city"]    = m.group(2).strip().title()
+                    result["zip"]     = m.group(3)
+
+        # Pattern 3: Any TX address in document — last resort, must validate
+        if not result.get("address"):
+            m = re.search(
+                r"(\d{3,6}\s+[A-Z][A-Z0-9\s#]+(?:LN|ST|AVE|DR|RD|BLVD|WAY|CT|PL|CIR|TRL|PKWY|LOOP|PASS|RUN|ROW|TER|TRCE|VW|XING|HWY|FWY))\s*[,\s]+([A-Z][A-Z\s]+?)\s*,?\s*TX\s+(\d{5})",
+                text, re.I
+            )
+            if m:
+                candidate = f"{m.group(1).strip()}, {m.group(2).strip()}, TX {m.group(3)}"
+                if is_valid_property_address(candidate):
+                    result["address"] = m.group(1).strip()
+                    result["city"]    = m.group(2).strip().title()
+                    result["zip"]     = m.group(3)
+
+        # Clean address of OCR errors
+        if result.get("address"):
+            result["address"] = self._clean_ocr_address(result["address"])
+            if result.get("city"):
+                result["city"] = self._clean_ocr_city(result["city"])
+
+        # ── Deed of Trust Date ────────────────────────────────────────────────
+        for pat in [
+            r"Deed\s+of\s+Trust\s+dated\s+((?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s*\d{4})",
+            r"Deed\s+of\s+Trust\s+dated\s+(\d{1,2}/\d{1,2}/\d{4})",
+            r"Date\s+((?:September|October|November|December|January|February|March|April|May|June|July|August)\s+\d{1,2},?\s*\d{4})\s*\n",
+            r"dated\s+((?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s*\d{4})",
+            r"executed\s+and\s+delivered\s+(?:that\s+certain\s+Deed\s+of\s+Trust,?\s+)?on\s+(\d{1,2}/\d{1,2}/\d{4})",
+            r"WHEREAS[,\s]+on\s+(\d{1,2}/\d{1,2}/\d{4}),",
+        ]:
+            m = re.search(pat, text, re.I)
+            if m:
+                d = m.group(1).strip().rstrip(".,")
+                if len(d) > 4:
+                    result["deed_date"] = d
+                    break
 
         # ── Legal Description ─────────────────────────────────────────────────
         m = re.search(r"Legal\s+Description[:\s]*\n?(LOT\s+\d+[^\n]+(?:\n[^\n]+){0,3})", text, re.I)
@@ -630,6 +699,36 @@ class HarrisCountyScraper:
                     break
 
         return result if any(result.values()) else None
+
+    def _clean_ocr_address(self, addr: str) -> str:
+        """Fix common OCR errors in street addresses."""
+        # Remove trailing barcode numbers
+        addr = re.sub(r'\s+\d{8,}$', '', addr)
+        # Fix OCR street type artifacts
+        addr = re.sub(r'\bSS\b', '', addr, flags=re.I)
+        return addr.strip().rstrip(',')
+
+    def _clean_ocr_city(self, city: str) -> str:
+        """Fix common OCR errors in city names."""
+        ocr_city_fixes = {
+            r"'[Oo]mball": "Tomball",
+            r"[Hh]umble": "Humble",
+            r"[Pp]earland": "Pearland",
+            r"[Kk]ingwood": "Kingwood",
+            r"[Ll]a\s*[Mm]arque": "La Marque",
+            r"[Ss][Ss]": "",  # remove SS artifact
+            r"[Ll][Ee]$": "",  # remove LE fragment
+        }
+        for pat, fix in ocr_city_fixes.items():
+            city = re.sub(pat, fix, city, flags=re.I)
+        city = city.strip().rstrip(',').strip()
+        # Remove duplicate words
+        words = city.split()
+        seen = []
+        for w in words:
+            if w.lower() not in [x.lower() for x in seen]:
+                seen.append(w)
+        return " ".join(seen).title()
 
     async def _hcad_lookup_by_owner(self, page, owner_name: str) -> Optional[dict]:
         """
@@ -1417,7 +1516,7 @@ def export_ghl_csv(records: list, path: str):
         "Mailing Address","Mailing City","Mailing State","Mailing Zip",
         "Property Address","Property City","Property State","Property Zip",
         "Lead Type","Document Type","Date Filed","Document Number",
-        "Sale Date","Auction Month",
+        "Sale Date","Auction Month","Deed Date",
         "Amount/Debt Owed","Seller Score","Motivated Seller Flags",
         "Source","Public Records URL",
     ]
@@ -1444,6 +1543,7 @@ def export_ghl_csv(records: list, path: str):
                 "Document Number":       r.get("doc_num",""),
                 "Sale Date":             r.get("sale_date",""),
                 "Auction Month":         r.get("auction_month",""),
+                "Deed Date":             r.get("deed_date",""),
                 "Amount/Debt Owed":      r.get("amount","") or "",
                 "Seller Score":          r.get("score",0),
                 "Motivated Seller Flags":" | ".join(r.get("flags",[])),
