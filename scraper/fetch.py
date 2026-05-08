@@ -182,6 +182,21 @@ def is_valid_property_address(addr: str) -> bool:
         "clerk_url": "", "flags": [], "score": 0,
     }
 
+def blank_rec(doc_code, cat, label) -> dict:
+    return {
+        "doc_num": "", "doc_type": doc_code, "filed": "",
+        "cat": cat, "cat_label": CAT_LABELS.get(cat, label),
+        "owner": "", "grantee": "", "amount": None, "legal": "",
+        "sale_date": "",   # auction date
+        "deed_date": "",   # original deed of trust date
+        "auction_month": "",
+        "prop_address": "", "prop_city": "Houston",
+        "prop_state": "TX", "prop_zip": "",
+        "mail_address": "", "mail_city": "",
+        "mail_state": "", "mail_zip": "",
+        "clerk_url": "", "flags": [], "score": 0,
+    }
+
 def score_record(rec: dict) -> tuple:
     flags, score = [], 30
     cat = rec.get("cat", "")
