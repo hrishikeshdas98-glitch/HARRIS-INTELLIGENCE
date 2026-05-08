@@ -428,18 +428,19 @@ class HarrisCountyScraper:
                 log.warning(f"  Time limit — stopping at {i}")
                 break
             try:
-                url = rec["clerk_url"]
+                # Use _pdf_url for PDF download (authenticated ViewECdocs URL)
+                # clerk_url stays as the public FRCL search link
+                pdf_url = rec.get("_pdf_url") or rec.get("clerk_url","")
+                if not pdf_url: continue
                 
-                # Fix URL to correct path
-                if "viewecdocs" in url.lower():
-                    id_match = re.search(r'[?&]ID=(.+)$', url, re.I)
+                # Fix URL to correct path for download
+                if "viewecdocs" in pdf_url.lower():
+                    id_match = re.search(r'[?&]ID=(.+)$', pdf_url, re.I)
                     if id_match:
-                        doc_id = id_match.group(1)
-                        url = f"{CLERK_BASE}/Applications/WebSearch/ViewECdocs.aspx?ID={doc_id}"
-                rec["clerk_url"] = url
+                        pdf_url = f"{CLERK_BASE}/Applications/WebSearch/ViewECdocs.aspx?ID={id_match.group(1)}"
 
                 # Download PDF
-                r = session.get(url, timeout=15)
+                r = session.get(pdf_url, timeout=15)
                 
                 if r.status_code != 200:
                     continue
@@ -470,8 +471,8 @@ class HarrisCountyScraper:
                 if not text:
                     continue
 
-                data = self._parse_frcl_pdf_text(text)
-                
+                data = self._parse_frcl_pdf_text(text) if text else None
+
                 if data:
                     if data.get("owner"):     rec["owner"]        = data["owner"]
                     if data.get("amount"):    rec["amount"]       = data["amount"]
@@ -481,31 +482,34 @@ class HarrisCountyScraper:
                     if data.get("legal_desc"):rec["legal"]        = data["legal_desc"]
                     if data.get("rp_number"): rec["legal"]        = f"RP: {data['rp_number']} | {rec.get('legal','')}"
 
-                    # Set address from PDF if valid (rejects law firm addresses)
+                    # Set address from PDF if valid
                     if data.get("address") and is_valid_property_address(data["address"]):
                         rec["prop_address"] = data["address"]
                         rec["prop_city"]    = data.get("city","Houston")
                         rec["prop_state"]   = "TX"
                         rec["prop_zip"]     = data.get("zip","")
 
-                    # HCAD lookup by owner name if no address found
-                    if not rec.get("prop_address") and data.get("owner"):
-                        addr = await self._hcad_lookup_by_owner(page, data["owner"])
-                        if addr and is_valid_property_address(addr.get("address","")):
-                            rec["prop_address"] = addr.get("address","")
-                            rec["prop_city"]    = addr.get("city","Houston")
-                            rec["prop_state"]   = "TX"
-                            rec["prop_zip"]     = addr.get("zip","")
+                # HCAD lookup if no address yet and we have an owner name
+                owner_for_lookup = rec.get("owner") or (data.get("owner") if data else None)
+                if not rec.get("prop_address") and owner_for_lookup:
+                    addr = await self._hcad_lookup_by_owner(page, owner_for_lookup)
+                    if addr and is_valid_property_address(addr.get("address","")):
+                        rec["prop_address"] = addr.get("address","")
+                        rec["prop_city"]    = addr.get("city","Houston")
+                        rec["prop_state"]   = "TX"
+                        rec["prop_zip"]     = addr.get("zip","")
 
-                    # Final fallback — clerk RP search
-                    if not rec.get("prop_address") and data.get("rp_number"):
-                        addr = await self._hcad_lookup_by_rp(page, data["rp_number"])
-                        if addr and is_valid_property_address(addr.get("address","")):
-                            rec["prop_address"] = addr.get("address","")
-                            rec["prop_city"]    = addr.get("city","Houston")
-                            rec["prop_state"]   = "TX"
-                            rec["prop_zip"]     = addr.get("zip","")
+                # RP number fallback
+                rp_num = data.get("rp_number") if data else None
+                if not rec.get("prop_address") and rp_num:
+                    addr = await self._hcad_lookup_by_rp(page, rp_num)
+                    if addr and is_valid_property_address(addr.get("address","")):
+                        rec["prop_address"] = addr.get("address","")
+                        rec["prop_city"]    = addr.get("city","Houston")
+                        rec["prop_state"]   = "TX"
+                        rec["prop_zip"]     = addr.get("zip","")
 
+                if data or rec.get("prop_address"):
                     enriched += 1
 
                 if (i+1) % 50 == 0:
@@ -525,8 +529,8 @@ class HarrisCountyScraper:
 
     def _extract_pdf_text(self, pdf_bytes: bytes) -> str:
         """
-        Extract text from image-based PDF using OCR with preprocessing.
-        The UNOFFICIAL COPY watermark corrupts OCR — we enhance contrast first.
+        Extract text from image-based PDF using OCR.
+        Crops the rotated sidebar text to avoid garbage characters.
         """
         try:
             import pdf2image
@@ -534,22 +538,22 @@ class HarrisCountyScraper:
             from PIL import ImageFilter, ImageEnhance
 
             def ocr_page(img):
-                # Convert to grayscale
+                w, h = img.size
+                # Crop out the left sidebar (~8% of width) which has rotated text
+                # that OCR reads as garbage
+                img = img.crop((int(w * 0.08), 0, w, h))
+                # Convert to grayscale + mild contrast boost
                 img = img.convert("L")
-                # Boost contrast to make black text stand out over grey watermark
-                img = ImageEnhance.Contrast(img).enhance(2.5)
-                # Sharpen edges
-                img = img.filter(ImageFilter.SHARPEN)
-                return pytesseract.image_to_string(img, lang="eng", config="--psm 6 --oem 3")
+                img = ImageEnhance.Contrast(img).enhance(1.5)
+                return pytesseract.image_to_string(img, lang="eng", config="--psm 6")
 
-            # Page 1 at 200 DPI
-            images = pdf2image.convert_from_bytes(pdf_bytes, dpi=200, first_page=1, last_page=1)
+            images = pdf2image.convert_from_bytes(pdf_bytes, dpi=150, first_page=1, last_page=1)
             result = ocr_page(images[0]) if images else ""
 
-            # Check page 2 if no "commonly known as" found
+            # Check page 2 if no "commonly known" found
             if result and "commonly known" not in result.lower():
                 try:
-                    imgs2 = pdf2image.convert_from_bytes(pdf_bytes, dpi=200, first_page=2, last_page=2)
+                    imgs2 = pdf2image.convert_from_bytes(pdf_bytes, dpi=150, first_page=2, last_page=2)
                     if imgs2:
                         result += "\n" + ocr_page(imgs2[0])
                 except: pass
@@ -725,18 +729,25 @@ class HarrisCountyScraper:
 
     def _clean_ocr_city(self, city: str) -> str:
         """Fix common OCR errors in city names."""
-        ocr_city_fixes = {
-            r"'[Oo]mball": "Tomball",
-            r"[Hh]umble": "Humble",
-            r"[Pp]earland": "Pearland",
-            r"[Kk]ingwood": "Kingwood",
-            r"[Ll]a\s*[Mm]arque": "La Marque",
-            r"[Ss][Ss]": "",  # remove SS artifact
-            r"[Ll][Ee]$": "",  # remove LE fragment
-        }
-        for pat, fix in ocr_city_fixes.items():
-            city = re.sub(pat, fix, city, flags=re.I)
         city = city.strip().rstrip(',').strip()
+        
+        # Remove single-letter OCR artifacts at start (e.g. "Z Spring" → "Spring", "S Galena Park" → "Galena Park")
+        city = re.sub(r'^[A-Z]\s+', '', city)
+        
+        # Fix known OCR misreads
+        ocr_fixes = {
+            r"^'[Oo]mball$": "Tomball",
+            r"^[Hh]umb?$": "Humble",        # truncated "Humb"
+            r"^[Pp]earl?$": "Pearland",      # truncated
+            r"^[Kk]ingw?$": "Kingwood",      # truncated
+            r"^[Ss][Ss]$": "Spring",         # double S OCR artifact
+            r"^[Ll][Ee]$": "",               # LE fragment
+        }
+        for pat, fix in ocr_fixes.items():
+            if re.match(pat, city, re.I):
+                city = fix
+                break
+        
         # Remove duplicate words
         words = city.split()
         seen = []
@@ -1240,6 +1251,13 @@ class HarrisCountyScraper:
                     elif len(dates_found) == 1:
                         sale_date = sale_date or dates_found[0]
 
+                # Build a public-accessible URL using the document ID search
+                # The FRCL page with doc ID pre-filled works without login
+                frcl_year = doc_num.split("-")[1] if "-" in doc_num else str(self.frcl_year)
+                public_url = (
+                    f"https://www.cclerk.hctx.net/applications/websearch/FRCL_R.aspx"
+                    f"?DocID={doc_num}"
+                )
                 rec = blank_rec("FRCL", "foreclosure", "Foreclosure Sale")
                 rec.update({
                     "doc_num":       doc_num,
@@ -1248,7 +1266,8 @@ class HarrisCountyScraper:
                     "sale_date":     sale_date,
                     "auction_month": auction_month,
                     "cat_label":     f"Foreclosure — {auction_month}",
-                    "clerk_url":     link or CLERK_FRCL,
+                    "clerk_url":     link or public_url,
+                    "_pdf_url":      link,  # Store original for PDF download
                 })
                 records.append(rec)
 
