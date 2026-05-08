@@ -348,15 +348,23 @@ class HarrisCountyScraper:
     # ── PDF enrichment via Playwright (uses existing login session) ───────────
     async def _enrich_frcl_pdfs(self, page) -> None:
         """
-        The ViewECdocs URL serves a direct PDF download (confirmed from logs).
-        We extract cookies from Playwright, then use requests to download each PDF,
-        then parse with pypdf.
+        Download each FRCL PDF, OCR it, extract owner/address/amount.
+        - Skips records already enriched (has prop_address)
+        - Caps at 300 per run to stay within GitHub Actions 6h limit
+        - Stops if elapsed time approaches 5 hours
         """
         frcl_recs = [r for r in self.records 
                      if r.get("doc_type") == "FRCL" and r.get("clerk_url")]
         
-        log.info(f"  Enriching {len(frcl_recs)} FRCL PDFs…")
+        # Only process unenriched records, prioritize June (most important)
+        unenriched = [r for r in frcl_recs if not r.get("prop_address")]
+        already_done = len(frcl_recs) - len(unenriched)
+        MAX_PER_RUN = 300
+        to_process = unenriched[:MAX_PER_RUN]
+        
+        log.info(f"  FRCL: {len(frcl_recs)} total | {already_done} already enriched | processing {len(to_process)}")
         enriched = 0
+        start_time = time.time()
 
         # Extract session cookies from Playwright
         cookies = await page.context.cookies()
@@ -368,7 +376,11 @@ class HarrisCountyScraper:
         for c in cookies:
             session.cookies.set(c["name"], c["value"], domain=c.get("domain",""))
 
-        for i, rec in enumerate(frcl_recs):
+        for i, rec in enumerate(to_process):
+            # Stop if approaching 5h elapsed
+            if time.time() - start_time > 4.5 * 3600:
+                log.warning(f"  Time limit — stopping at {i}")
+                break
             try:
                 url = rec["clerk_url"]
                 
@@ -450,16 +462,19 @@ class HarrisCountyScraper:
                     enriched += 1
 
                 if (i+1) % 50 == 0:
-                    log.info(f"  PDF {i+1}/{len(frcl_recs)} — {enriched} enriched")
+                    with_addr = sum(1 for r in frcl_recs if r.get("prop_address"))
+                    elapsed_m = (time.time() - start_time) / 60
+                    log.info(f"  PDF {i+1}/{len(to_process)} — {enriched} enriched, {with_addr} total with address ({elapsed_m:.0f}m)")
 
-                time.sleep(0.1)
+                time.sleep(0.05)
 
             except Exception as exc:
                 if i < 5:
                     log.warning(f"  PDF {rec.get('doc_num','?')}: {exc}")
                 continue
 
-        log.info(f"  PDF enrichment done: {enriched}/{len(frcl_recs)} enriched")
+        with_addr_total = sum(1 for r in frcl_recs if r.get("prop_address"))
+        log.info(f"  PDF done: {enriched} enriched this run | {with_addr_total}/{len(frcl_recs)} foreclosures with address")
 
     def _extract_pdf_text(self, pdf_bytes: bytes) -> str:
         """
@@ -470,18 +485,27 @@ class HarrisCountyScraper:
             import pdf2image
             import pytesseract
             
-            # Convert first 2 pages only (all key info is on page 1)
+            # 150 DPI is sufficient for these docs and 2x faster than 200
             images = pdf2image.convert_from_bytes(
                 pdf_bytes,
-                dpi=200,
+                dpi=150,
                 first_page=1,
-                last_page=2,
+                last_page=1,  # Page 1 has all key info
             )
             pages = []
             for img in images:
                 text = pytesseract.image_to_string(img, lang="eng")
                 pages.append(text)
             result = "\n".join(pages)
+            # If address not found on page 1, check page 2
+            if result and "commonly known" not in result.lower() and \
+               not re.search(r"\d{4,5}\s+[A-Z].*\bTX\b", result):
+                try:
+                    imgs2 = pdf2image.convert_from_bytes(
+                        pdf_bytes, dpi=150, first_page=2, last_page=2)
+                    if imgs2:
+                        result += "\n" + pytesseract.image_to_string(imgs2[0], lang="eng")
+                except: pass
             return result
         except Exception as exc:
             # Fallback to pypdf for text-layer PDFs
