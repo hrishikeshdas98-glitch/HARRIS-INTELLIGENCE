@@ -356,10 +356,10 @@ class HarrisCountyScraper:
         frcl_recs = [r for r in self.records 
                      if r.get("doc_type") == "FRCL" and r.get("clerk_url")]
         
-        # Only process unenriched records, prioritize June (most important)
+        # Only process records without an address yet
         unenriched = [r for r in frcl_recs if not r.get("prop_address")]
         already_done = len(frcl_recs) - len(unenriched)
-        MAX_PER_RUN = 300
+        MAX_PER_RUN = 400  # increased since address fix means fewer HCAD calls needed
         to_process = unenriched[:MAX_PER_RUN]
         
         log.info(f"  FRCL: {len(frcl_recs)} total | {already_done} already enriched | processing {len(to_process)}")
@@ -546,13 +546,15 @@ class HarrisCountyScraper:
 
         # ── Owner/Grantor ─────────────────────────────────────────────────────
         for pat in [
-            # Structured table: "Grantor    Leslie Siclaly Villatoro" (PDF 2 type)
-            r"Grantor\s{1,10}([A-Za-z][A-Za-z\s\-\.]+?)\n",
+            # Structured table: "Grantor    Leslie Siclaly Villatoro\n"
+            r"Grantor\s{1,20}([A-Za-z][A-Za-z\s\-\.]{3,50}?)\s*\n",
             # "with NAME and NAME, wife and husband as Grantor(s)"
             r"with\s+([A-Za-z][A-Za-z\s\-]+?(?:\s+and\s+[A-Za-z\s\-]+?)?),?\s+(?:wife|husband|unmarried|married|individual|trustee)",
-            # "NAME as Grantor(s)"  
-            r"([A-Za-z][A-Za-z\s\-]+?(?:\s+and\s+[A-Za-z\s\-]+?)?)\s+as\s+Grantor",
-            # "executed by NAME and NAME securing"
+            # "NAME, an unmarried woman, as Grantor" — name BEFORE descriptor
+            r"([A-Za-z][A-Za-z\s\-]+?),\s+(?:an?\s+)?(?:unmarried|married|individual)[^,]+,?\s+as\s+Grantor",
+            # "NAME as Grantor(s)" — must have enough chars to be a name
+            r"([A-Za-z][A-Za-z\s\-]{5,50}?)\s+as\s+Grantor",
+            # "executed by NAME securing"
             r"executed\s+by\s+([A-Za-z][A-Za-z\s\-]+?(?:\s+and\s+[A-Za-z\s\-]+?)?)\s+securing",
             # WHEREAS "NAME joined herein"
             r"WHEREAS[,\s]+on\s+[\w/,\s]+,\s+([A-Za-z][A-Za-z\s\-]+?)\s+joined\s+herein",
@@ -560,6 +562,10 @@ class HarrisCountyScraper:
             m = re.search(pat, text, re.I)
             if m:
                 owner = re.sub(r'\s+', ' ', m.group(1).strip().strip(","))
+                skip = ["the property","said property","real property","deed of trust",
+                        "note described","substitute trustee","mortgage servicer"]
+                if any(w in owner.lower() for w in skip):
+                    continue
                 if 3 < len(owner) < 80:
                     result["owner"] = owner
                     break
@@ -594,10 +600,11 @@ class HarrisCountyScraper:
                 result["city"] = words[-1].title() if words else "Houston"
 
         # Pattern 2: Header address block (2-line: street \n city, TX zip)
-        # e.g. "11603 DOWNEY VIOLET LN\nHOUSTON, TX 77044"
+        # e.g. "11603 DOWNEY VIOLET LN 00000010704641\nHOUSTON, TX 77044"
+        # Note: [^\n]* handles trailing barcode numbers after street type
         if not result.get("address"):
             m = re.search(
-                r"(\d{3,6}\s+[A-Z0-9][A-Z0-9\s#\.]+(?:LN|ST|AVE|DR|RD|BLVD|WAY|CT|PL|CIR|TRL|PKWY|LOOP|PASS|RUN|ROW|TER|TRCE|VW|XING|HWY|FWY))\s*\n\s*([A-Z][A-Z\s]+?),?\s*TX\s+(\d{5})",
+                r"(\d{3,6}\s+[A-Z0-9][A-Z0-9\s#\.]+(?:LN|ST|AVE|DR|RD|BLVD|WAY|CT|PL|CIR|TRL|PKWY|LOOP|PASS|RUN|ROW|TER|TRCE|VW|XING|HWY|FWY))[^\n]*\n\s*([A-Z][A-Z\s]+?),?\s*TX\s+(\d{5})",
                 text, re.I
             )
             if m:
