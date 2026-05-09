@@ -139,35 +139,45 @@ def name_variants(name: str) -> list:
 
 def is_valid_property_address(addr: str) -> bool:
     """
-    Reject addresses that are clearly law firm offices, servicers, or OCR garbage.
-    Harris County property zips start with 770-778.
+    Reject addresses that are clearly auction locations, law firms, or OCR garbage.
     """
     if not addr or len(addr) < 10: return False
     addr_lower = addr.lower()
     
-    # Must have a Harris County zip (770xx-778xx) OR no zip at all (zip checked separately)
-    # Look for zip specifically at end or after TX/TEXAS — not house numbers
+    # Reject known auction venue, law firms, servicer addresses
+    bad_exact = [
+        "9401 knight",        # Bayou City Event Center - auction location
+        "14160 dallas",       # Barrett Daffin law firm
+        "20405 state highway",# Codilis & Moody law firm  
+        "15000 surveyor",
+        "1900 saint james",
+        "9441 lbj",
+        "p.o. box", "po box",
+        "certificate of posting",
+        "huntington beach", "anaheim", "california",
+        "greenville, sc", "orange, ca",
+        "this instrument", "appoints the sub",  # OCR document text
+    ]
+    if any(p in addr_lower for p in bad_exact):
+        return False
+
+    # Reject out-of-county zips (Dallas=75xxx, Austin=78xxx etc.)
     zip_m = re.search(r'(?:TX|TEXAS)[,\s]+(\d{5})\b', addr, re.I)
     if zip_m:
         z = zip_m.group(1)
         if not z.startswith(('770','771','772','773','774','775','776','777','778')):
-            return False  # Dallas, Austin, California etc.
-    
-    # Reject known garbage patterns
-    bad_patterns = [
-        "certificate of posting", "p.o. box", "po box",
-        "14160 dallas", "state highway 249",
-        "beattie place", "tamarack road", "college blvd",
-        "huntington beach", "anaheim", "california",
-        "greenville, sc", "orange, ca",
-    ]
-    if any(p in addr_lower for p in bad_patterns):
-        return False
-    
+            return False
+
     # Must start with a house number
     if not re.match(r'^\d{2,6}\s+[A-Za-z]', addr):
         return False
-    
+
+    # Reject obvious OCR garbage (too many special chars or short words)
+    words = addr.split()
+    if len(words) < 3: return False
+    garbage_chars = sum(1 for c in addr if c in "[]|{}\\@#$%^&*()+=<>")
+    if garbage_chars > 1: return False
+
     return True
     return {
         "doc_num": "", "doc_type": doc_code, "filed": "",
@@ -483,22 +493,24 @@ class HarrisCountyScraper:
                     if data.get("legal_desc"):rec["legal"]        = data["legal_desc"]
                     if data.get("rp_number"): rec["legal"]        = f"RP: {data['rp_number']} | {rec.get('legal','')}"
 
-                    # Set address from PDF if valid
-                    if data.get("address") and is_valid_property_address(data["address"]):
-                        rec["prop_address"] = data["address"]
-                        rec["prop_city"]    = data.get("city","Houston")
-                        rec["prop_state"]   = "TX"
-                        rec["prop_zip"]     = data.get("zip","")
-
-                # HCAD lookup if no address yet and we have an owner name
+                # HCAD by owner name — most reliable, try FIRST
                 owner_for_lookup = rec.get("owner") or (data.get("owner") if data else None)
-                if not rec.get("prop_address") and owner_for_lookup:
+                if owner_for_lookup:
                     addr = await self._hcad_lookup_by_owner(page, owner_for_lookup)
                     if addr and is_valid_property_address(addr.get("address","")):
                         rec["prop_address"] = addr.get("address","")
                         rec["prop_city"]    = addr.get("city","Houston")
                         rec["prop_state"]   = "TX"
                         rec["prop_zip"]     = addr.get("zip","")
+
+                # Only use OCR address if HCAD lookup failed
+                if not rec.get("prop_address") and data and data.get("address"):
+                    ocr_addr = data["address"]
+                    if is_valid_property_address(ocr_addr):
+                        rec["prop_address"] = ocr_addr
+                        rec["prop_city"]    = data.get("city","Houston")
+                        rec["prop_state"]   = "TX"
+                        rec["prop_zip"]     = data.get("zip","")
 
                 # RP number fallback
                 rp_num = data.get("rp_number") if data else None
@@ -615,8 +627,13 @@ class HarrisCountyScraper:
             if m:
                 owner = re.sub(r'\s+', ' ', m.group(1).strip().strip(","))
                 skip = ["the property","said property","real property","deed of trust",
-                        "note described","substitute trustee","mortgage servicer"]
+                        "note described","substitute trustee","mortgage servicer",
+                        "this instrument","fincen","appoints","trustee","registrat",
+                        "harris county","texas","substitute","beneficiary","servicer"]
                 if any(w in owner.lower() for w in skip):
+                    continue
+                # Must look like a name (has at least one lowercase letter or is all caps short)
+                if not re.search(r'[A-Z][a-z]|^[A-Z\s]{3,40}$', owner):
                     continue
                 if 3 < len(owner) < 80:
                     result["owner"] = owner
